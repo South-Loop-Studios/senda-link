@@ -1,11 +1,13 @@
+//! Compiles and runs `abi_probe.c` against Apple's SDK, then compares the
+//! sizes, offsets and four-character codes it prints with the declarations
+//! in `senda_link::ffi::types`.
+
 use senda_link::ffi::types::*;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Compiles and runs the C probe once per test process. The tests run in parallel and all
-/// need the same table, and four concurrent `clang` invocations writing one output path is
-/// a race, so the result is shared through a `OnceLock`.
+/// Once per test process: concurrent `clang` runs writing one output path would race.
 fn probe() -> &'static HashMap<String, usize> {
     static PROBE: OnceLock<HashMap<String, usize>> = OnceLock::new();
     PROBE.get_or_init(run_probe)
@@ -162,14 +164,9 @@ fn abi_layout_matches_sdk() {
         g("clientinfo_off_bundleid")
     );
 
-    // All 22 function-pointer members, in declaration order. This catches a
-    // member being inserted, deleted, or reordered — the drift mode that
-    // actually happens when this struct or the SDK header changes. It does
-    // NOT catch two same-signature members being transposed with each other
-    // (e.g. BeginIOOperation <-> EndIOOperation): every vtable member is an
-    // 8-byte function pointer, so offset_of! cannot distinguish which
-    // specific function ended up in which same-shaped slot. See the
-    // LIMITATION comment at the top of tests/abi_probe.c.
+    // All 22 members in declaration order. Insertions, deletions and reorders
+    // are caught; a transposition of two same-signature members is not, since
+    // every slot is an 8-byte pointer.
     assert_eq!(
         std::mem::offset_of!(AudioServerPlugInDriverInterface, QueryInterface),
         g("iface_off_queryinterface")
@@ -268,15 +265,6 @@ fn abi_layout_matches_sdk() {
 
 #[test]
 fn fourcc_matches_known_constants() {
-    // The two `DoIOOperation` operation IDs the whole IO path hinges on:
-    // `kAudioServerPlugInIOOperationWriteMix` is `'rite'` and
-    // `kAudioServerPlugInIOOperationReadInput` is `'read'`. With a wrong
-    // value, `senda_WillDoIOOperation` never matches a real `inOperationID`
-    // the HAL asks about and `senda_DoIOOperation` is never called at all —
-    // silent output and input despite the device enumerating, starting, and
-    // keeping time correctly. Asserted against the real SDK header via
-    // `tests/abi_probe.c` so that failure mode shows up at `cargo test`
-    // rather than only in a manual audio check.
     let p = probe();
     let g = |k: &str| *p.get(k).unwrap_or_else(|| panic!("probe missing {k}"));
     assert_eq!(
@@ -290,10 +278,6 @@ fn fourcc_matches_known_constants() {
         "kAudioServerPlugInIOOperationReadInput must be 'read' (not the look-alike 'rinp')"
     );
 
-    // `kAudioObjectPropertyOwner` is `'stdv'`. `'stmo'` is a different real
-    // selector (`kAudioHardwarePropertyMixStereoToMono`) that looks
-    // plausible in its place, so both values are checked and a mix-up in
-    // either direction is caught rather than only one side.
     assert_eq!(
         fourcc(b"stdv") as usize,
         g("prop_owner"),
@@ -306,28 +290,17 @@ fn fourcc_matches_known_constants() {
     );
 }
 
-/// Every remaining fourcc constant used anywhere in `src/` (class IDs,
-/// property selectors, scopes, transport types, a format ID, and error
-/// codes), matched against its real Apple SDK macro via
-/// `tests/abi_probe.c`. Nothing is trusted by eye: the failure mode for a
-/// wrong constant here is a device that enumerates, starts, keeps perfect
-/// time, and passes no audio — nothing a type-checker or a quick manual
-/// glance catches, whether the value was invented outright or is a real
-/// selector used in the wrong place.
+/// A wrong constant here is a device that enumerates, keeps time and passes no audio.
 #[test]
 fn fourcc_matches_every_remaining_production_constant() {
     let p = probe();
     let g = |k: &str| *p.get(k).unwrap_or_else(|| panic!("probe missing {k}"));
 
-    // (fourcc bytes as used in src/, probe key, the real SDK macro name —
-    // purely documentation for a failure message, not re-derived).
     let checks: &[(&[u8; 4], &str, &str)] = &[
-        // Class IDs (engine::properties: bcls/clas answers).
         (b"aobj", "class_object", "kAudioObjectClassID"),
         (b"aplg", "class_plugin", "kAudioPlugInClassID"),
         (b"adev", "class_device", "kAudioDeviceClassID"),
         (b"astr", "class_stream", "kAudioStreamClassID"),
-        // AudioObject-level properties.
         (b"bcls", "prop_base_class", "kAudioObjectPropertyBaseClass"),
         (b"clas", "prop_class", "kAudioObjectPropertyClass"),
         (
@@ -346,12 +319,9 @@ fn fourcc_matches_every_remaining_production_constant() {
             "kAudioObjectPropertyManufacturer",
         ),
         (b"lnam", "prop_name", "kAudioObjectPropertyName"),
-        // Scopes (engine::properties::SCOPE_INPUT/SCOPE_OUTPUT).
         (b"inpt", "scope_input", "kAudioObjectPropertyScopeInput"),
         (b"outp", "scope_output", "kAudioObjectPropertyScopeOutput"),
-        // Not a named constant in src/ — see the doc comment above.
         (b"glob", "scope_global", "kAudioObjectPropertyScopeGlobal"),
-        // Plugin-level properties (engine::properties::plugin_property).
         (b"dev#", "dev_device_list", "kAudioPlugInPropertyDeviceList"),
         (
             b"uidd",
@@ -363,7 +333,6 @@ fn fourcc_matches_every_remaining_production_constant() {
             "dev_resource_bundle",
             "kAudioPlugInPropertyResourceBundle",
         ),
-        // Device-level properties (engine::properties::device_property).
         (b"uid ", "dev_uid", "kAudioDevicePropertyDeviceUID"),
         (b"muid", "dev_model_uid", "kAudioDevicePropertyModelUID"),
         (
@@ -441,16 +410,11 @@ fn fourcc_matches_every_remaining_production_constant() {
             "dev_preferred_stereo",
             "kAudioDevicePropertyPreferredChannelsForStereo",
         ),
-        // The load-bearing one: see the non-negotiable note on
-        // `device::BLOCK` and `device::RING_FRAMES`. A wrong value here
-        // would misroute every GetPropertyData('ring') query, not merely
-        // misreport a cosmetic property.
         (
             b"ring",
             "dev_zero_timestamp_period",
             "kAudioDevicePropertyZeroTimeStampPeriod",
         ),
-        // Stream-level properties (engine::properties::stream_property).
         (b"sact", "stream_is_active", "kAudioStreamPropertyIsActive"),
         (b"sdir", "stream_direction", "kAudioStreamPropertyDirection"),
         (
@@ -483,12 +447,7 @@ fn fourcc_matches_every_remaining_production_constant() {
             "stream_available_physical_formats",
             "kAudioStreamPropertyAvailablePhysicalFormats",
         ),
-        // Format ID (engine::properties::build_asbd's LPCM format_id).
         (b"lpcm", "format_linear_pcm", "kAudioFormatLinearPCM"),
-        // Error codes: `ffi::plugin`'s `ERR_UNKNOWN_PROPERTY`,
-        // `ERR_UNSUPPORTED`, `ERR_BAD_OBJECT`, `ERR_BAD_PROPERTY_SIZE` and
-        // `ERR_UNSPECIFIED`, plus `engine::properties::ERR_ILLEGAL_VALUE` —
-        // each derived with `fourcc` rather than hand-copied as a decimal.
         (
             b"who?",
             "err_unknown_property",
@@ -523,30 +482,15 @@ fn fourcc_matches_every_remaining_production_constant() {
     }
 }
 
-/// `abi_layout_matches_sdk` above only proves `MachTimebaseInfo`'s
-/// `numer`/`denom` fields sit at the same byte offsets as the real
-/// `mach_timebase_info_data_t` — it says nothing about whether the values
-/// actually read through this crate's `extern "C"` declaration match a real
-/// call to the same function. An inverted or otherwise corrupted timebase
-/// ratio would still pass every layout check while being roughly 40x wrong
-/// on Apple Silicon (`numer`/`denom` ~= 125/3 there; the reciprocal,
-/// `denom`/`numer`, is ~= 3/125), silently mis-scaling every
-/// `mach_absolute_time()` reading `ffi::plugin`'s `host_ns_per_tick`
-/// depends on — a device which enumerates, starts, and passes audio, just
-/// on a badly wrong clock, and survives a fully green test suite that only
-/// checks layout. This calls the same `mach_timebase_info` this crate
-/// declares (via its own FFI binding, not a re-declared one) and compares
-/// against `tests/abi_probe.c`'s live call to the real function on the same
-/// machine.
+/// Layout equality says nothing about the values read through the `extern "C"`
+/// declaration; an inverted ratio passes every offset check and is ~40x wrong.
 #[test]
 fn mach_timebase_info_matches_a_live_probe_call() {
     let p = probe();
     let g = |k: &str| *p.get(k).unwrap_or_else(|| panic!("probe missing {k}"));
 
     let mut info = MachTimebaseInfo::default();
-    // SAFETY: `&mut info` is a valid, uniquely-owned, correctly-sized
-    // `MachTimebaseInfo` for the duration of this call — test-only use of
-    // the same FFI declaration `ffi::plugin::host_ns_per_tick` calls.
+    // SAFETY: `info` is a valid, exclusively borrowed `MachTimebaseInfo`.
     let kr = unsafe { mach_timebase_info(&mut info) };
     assert_eq!(
         kr as usize,
@@ -563,11 +507,6 @@ fn mach_timebase_info_matches_a_live_probe_call() {
         g("timebase_live_denom"),
         "MachTimebaseInfo.denom must match a live call to the real mach_timebase_info"
     );
-    // On this run's machine (see the values above), confirm the ratio
-    // actually used by `host_ns_per_tick` (numer/denom) is the right way
-    // round, not its ~40x-off reciprocal — belt-and-suspenders alongside
-    // the exact-value checks above, expressed as the property that
-    // actually matters operationally.
     assert!(
         info.numer > 0 && info.denom > 0,
         "a zero numer/denom would divide by zero downstream"
