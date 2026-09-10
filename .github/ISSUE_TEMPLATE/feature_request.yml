@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a change to what the driver does
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please open this issue before writing code. Senda Link is a HAL driver that ships signed, so every
+        behaviour change is weighed against the risk to every application's audio. We would rather agree on
+        the shape of a change here than review a finished PR we cannot merge.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can you not do today, and in what workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What would the driver do differently? If it changes a property the HAL sees, name it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including doing it in the host application instead of the driver.
+  - type: checkboxes
+    id: agree
+    attributes:
+      label: Before building
+      options:
+        - label: I understand this needs discussion and agreement here before a pull request is opened
+          required: true

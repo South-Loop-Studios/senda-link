@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build, bundle, test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Bundle before test, deliberately: tests/version.rs checks the bundled Info.plist and is
+      # skipped when there is no bundle, so testing first would let it pass for ever.
+      - name: cargo xtask bundle
+        run: cargo xtask bundle
+
+      - name: cargo test
+        run: cargo test --workspace -- --include-ignored
+
+      - name: the bundle carries the declared version
+        run: |
+          WANT=$(python3 -c 'import json;print(json.load(open("version.json"))["version"])')
+          GOT=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' target/SendaLink.driver/Contents/Info.plist)
+          [ "$WANT" = "$GOT" ] || { echo "::error::version.json says $WANT, bundle says $GOT"; exit 1; }
+          echo "both say $WANT"
+
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: every commit in the PR is signed off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <.+@.+>$'; then
+              echo "::error::commit $sha has no Signed-off-by trailer"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Add a sign-off with: git rebase --signoff $BASE, then force-push to your branch."
+            exit 1
+          fi
+          echo "all commits signed off"

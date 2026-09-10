@@ -1,0 +1,89 @@
+name: Bug report
+description: Something the driver does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The more of the environment you can give us, the faster we can reproduce it.
+        If you think this is a security problem, please do not file it here; see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Senda Link version
+      description: "From the installer, or: defaults read /Library/Audio/Plug-Ins/HAL/SendaLink.driver/Contents/Info.plist CFBundleShortVersionString"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: e.g. 15.6.1 (24G90)
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac model and chip
+      placeholder: e.g. MacBook Pro 14-inch 2023, M3 Pro
+    validations:
+      required: true
+  - type: input
+    id: interface
+    attributes:
+      label: Audio interface(s) in use, if any
+      placeholder: e.g. RME Babyface Pro FS over USB; or "none, built-in only"
+  - type: input
+    id: host
+    attributes:
+      label: Host application or DAW, with version
+      placeholder: e.g. Logic Pro 11.2, Reaper 7.3, Chrome 131, a custom CoreAudio client
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: Which Senda Link device
+      options: ["2ch", "8ch", "16ch", "32ch", "128ch", "several", "not sure"]
+    validations:
+      required: true
+  - type: input
+    id: rate
+    attributes:
+      label: Sample rate
+      placeholder: e.g. 48000
+    validations:
+      required: true
+  - type: input
+    id: buffer
+    attributes:
+      label: Buffer size (frames), as set in the host
+      placeholder: e.g. 256
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, starting from a fresh launch of the host if possible.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: |
+        Paste anything relevant: the host's own log, and
+        `log show --last 10m --predicate 'process == "coreaudiod"'` around the time of the fault.
+        Please remove anything private before pasting.
+      render: shell
+  - type: checkboxes
+    id: aggregate
+    attributes:
+      label: Aggregate devices
+      options:
+        - label: The Senda Link device was part of an Aggregate or Multi-Output device when this happened

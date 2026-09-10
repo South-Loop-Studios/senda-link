@@ -1,0 +1,34 @@
+[workspace]
+members = ["xtask"]
+
+[package]
+name = "senda-link"
+# NOT the product's version, deliberately. version.json is the only place that states it, and
+# cargo cannot read a version out of a file — a manifest's version has to be a literal. Nothing
+# here consumes CARGO_PKG_VERSION (this crate is a cdylib for a HAL driver, not a published
+# library), so this is pinned at 0.0.0 and means nothing. `tests/version.rs` fails if someone
+# starts maintaining it.
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+# The floor clippy's `incompatible_msrv` lint reports for what the crate actually uses.
+rust-version = "1.87"
+
+[lib]
+# Rust's rlib/extern-crate name always comes from [lib] name (dashes -> underscores
+# for the package-name default; an explicit override like "SendaLink" is taken
+# verbatim, case and all). tests/abi.rs does `use senda_link::...`, so the name
+# here must be exactly that — not the CamelCase bundle executable name. The cdylib
+# build artifact is therefore libsenda_link.dylib; xtask renames it to
+# "SendaLink" when it copies the binary into the .driver bundle, matching
+# Info.plist's CFBundleExecutable.
+name = "senda_link"
+crate-type = ["cdylib", "rlib"]  # rlib so tests/abi.rs can link the library
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

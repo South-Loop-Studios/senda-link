@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.senda.link.driver</string>
+    <key>CFBundleName</key>
+    <string>SendaLink</string>
+    <key>CFBundleExecutable</key>
+    <string>SendaLink</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleVersion</key>
+    <string>${VERSION}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>9F3D1A62-5E77-4C1B-9E0A-2B7C6D4E8F10</key>
+        <string>SendaLinkCreate</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+        <array>
+            <string>9F3D1A62-5E77-4C1B-9E0A-2B7C6D4E8F10</string>
+        </array>
+    </dict>
+</dict>
+</plist>
