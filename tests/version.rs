@@ -1,23 +1,11 @@
-//! **`version.json` is the only place this product's version is written.** These tests are what
-//! keeps that true.
-//!
-//! The version is written once, in `version.json`. `Info.plist` carries the `${VERSION}`
-//! placeholder and `xtask bundle` substitutes the real value, the same shape the release
-//! pipeline uses. `Cargo.toml`'s version is pinned at 0.0.0 and unused, because cargo cannot
-//! read a version out of a file and nothing here consumes `CARGO_PKG_VERSION`.
-//!
-//! A second copy would be a silent one: nothing propagates a bump between copies, so a release
-//! announcing one version while the installed driver's Get Info showed another would need only
-//! one forgotten edit, and nothing would fail. The user would simply be told two different things
-//! by one product.
-//!
-//! These tests therefore assert an *absence*: that no second home has grown.
+//! The version is written once, in `version.json`. `Info.plist` carries a
+//! `${VERSION}` placeholder that `xtask bundle` substitutes, and `Cargo.toml`'s
+//! version is a 0.0.0 sentinel. These tests assert that no second copy has grown.
 
 use std::fs;
 
 const PLACEHOLDER: &str = "${VERSION}";
 
-/// The one home, parsed the way `xtask` parses it.
 fn declared_version() -> String {
     let text = fs::read_to_string("version.json").expect("version.json");
     text.split("\"version\"")
@@ -27,8 +15,7 @@ fn declared_version() -> String {
         .to_string()
 }
 
-/// A version that is not three dot-separated numbers is one a git tag cannot match and the
-/// release pipeline will refuse — caught here rather than four minutes into a release.
+/// Anything else is a version a git tag cannot match.
 #[test]
 fn the_declared_version_is_a_plain_three_part_number() {
     let v = declared_version();
@@ -46,9 +33,6 @@ fn the_declared_version_is_a_plain_three_part_number() {
     }
 }
 
-/// **`Info.plist` must ask, never state.** A literal version here is a second home, and a silent
-/// one: the plist is what macOS shows in Get Info for the installed driver, so a stale literal
-/// tells the user something the release pipeline contradicts.
 #[test]
 fn info_plist_asks_for_the_version_rather_than_stating_one() {
     let plist = fs::read_to_string("Info.plist").expect("Info.plist");
@@ -68,9 +52,6 @@ fn info_plist_asks_for_the_version_rather_than_stating_one() {
     }
 }
 
-/// **`Cargo.toml`'s version is a sentinel and must stay one.** Cargo cannot derive a version from
-/// a file, so the only way for it not to be a second home is for it to mean nothing. Nothing here
-/// reads `CARGO_PKG_VERSION`; if that changes, this test is the place the change gets noticed.
 #[test]
 fn cargo_toml_is_not_a_second_home_for_the_version() {
     let cargo = fs::read_to_string("Cargo.toml").expect("Cargo.toml");
@@ -88,13 +69,7 @@ fn cargo_toml_is_not_a_second_home_for_the_version() {
     );
 }
 
-/// The end-to-end property, asserted against the artefact rather than the intention: whatever
-/// `version.json` says is what a user sees in Get Info.
-///
-/// Ignored by default because a plain `cargo test` must not require `cargo xtask bundle` to
-/// have been run first. CI bundles and then runs `cargo test -- --include-ignored`, so it is
-/// checked against a real artefact there, and it fails rather than skips if the bundle is
-/// missing.
+/// Ignored so a plain `cargo test` needs no bundle; CI bundles first and runs `--include-ignored`.
 #[test]
 #[ignore = "needs `cargo xtask bundle` first; CI runs it with --include-ignored"]
 fn the_bundled_driver_carries_the_version_that_was_declared() {

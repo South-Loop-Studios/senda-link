@@ -1,22 +1,11 @@
-//! The 22-entry `AudioServerPlugInDriverInterface` vtable.
-//!
-//! The interface is COM-style: `QueryInterface` echoes the driver handle
-//! back and `AddRef`/`Release` are constant, since the driver lives for the
-//! whole `coreaudiod` process. Devices are published statically, so
-//! `CreateDevice`/`DestroyDevice` answer 'unop' and the remaining lifecycle
-//! entries are no-ops. The property entries marshal raw HAL pointers into
-//! safe values for `engine::properties` and serialise its `Value`s back out.
+//! The 22-entry COM-style `AudioServerPlugInDriverInterface` vtable.
+//! `QueryInterface` echoes the driver handle and `AddRef`/`Release` are
+//! constant; devices are static, so the lifecycle entries are no-ops.
+//! Property entries marshal raw HAL pointers to and from `engine::properties`.
 //! `StartIO`/`StopIO` ref-count clients per device; the first client's
-//! `StartIO` (re)anchors the clock and wipes the ring. `GetZeroTimeStamp`
-//! is `Clock::zero_timestamp`. `DoIOOperation` clamps the frame count to
-//! `MAX_BUFFER_FRAMES` and hands an `f32` slice to `engine::io`, indexed by
-//! the HAL's own sample time for the cycle.
-//!
-//! `engine/` is `#![forbid(unsafe_code)]`; apart from the `SendaLinkCreate`
-//! factory in `lib.rs`, every `unsafe` in the crate lives under `src/ffi/`.
-//! Nothing on the IO path (`GetZeroTimeStamp`, `DoIOOperation`) allocates,
-//! locks or can panic: a panic unwinding across `extern "C"` would abort
-//! `coreaudiod` and take all system audio down with it.
+//! `StartIO` anchors the clock and wipes the ring. `DoIOOperation` hands an
+//! `f32` slice to `engine::io`, indexed by the HAL's sample time for the cycle.
+//! Nothing on the IO path allocates, locks or can panic.
 
 use super::types::*;
 use crate::engine::clock::CLOCKS;
@@ -27,91 +16,57 @@ use std::ffi::{c_char, c_void};
 use std::sync::atomic::Ordering;
 
 pub const OK: OSStatus = 0;
-/// `kAudioHardwareUnknownPropertyError` ('who?'): the selector isn't one
-/// this object kind answers. Computed via `fourcc` rather than hand-copied
-/// as a decimal literal, so a transcription error is impossible; equals
-/// 2003332927.
+/// `kAudioHardwareUnknownPropertyError`: the selector isn't one this object kind answers.
 pub const ERR_UNKNOWN_PROPERTY: OSStatus = fourcc(b"who?") as OSStatus;
-/// `kAudioHardwareUnsupportedOperationError` ('unop'): a real property of
-/// this object, but this driver doesn't allow the requested operation on
-/// it. Same `fourcc`-not-decimal treatment as `ERR_UNKNOWN_PROPERTY` above.
-/// Equals 1970171760.
+/// `kAudioHardwareUnsupportedOperationError`: a real property, but not this operation on it.
 pub const ERR_UNSUPPORTED: OSStatus = fourcc(b"unop") as OSStatus;
-/// `kAudioHardwareBadObjectError` ('!obj'): the `AudioObjectID` doesn't name
-/// an object this driver owns. Same `fourcc`-not-decimal treatment as
-/// `ERR_UNKNOWN_PROPERTY` above. Equals 560947818.
+/// `kAudioHardwareBadObjectError`: the `AudioObjectID` names nothing this driver owns.
 pub const ERR_BAD_OBJECT: OSStatus = fourcc(b"!obj") as OSStatus;
-/// `kAudioHardwareBadPropertySizeError` ('!siz'): the host's buffer is
-/// smaller than the property actually needs. Returned instead of silently
-/// truncating — see `write_value`. Computed via `fourcc` rather than
-/// hand-copied as a decimal literal; equals 561211770.
+/// `kAudioHardwareBadPropertySizeError`: the host's buffer is smaller than
+/// the property needs; returned rather than truncating (see `write_value`).
 pub const ERR_BAD_PROPERTY_SIZE: OSStatus = fourcc(b"!siz") as OSStatus;
-/// `kAudioHardwareUnspecifiedError` ('what'): CoreFoundation failed to
-/// create a string (e.g. allocation failure). Vanishingly unlikely, but
-/// must not be treated as success — see `write_value`'s `Value::Str` arm.
+/// `kAudioHardwareUnspecifiedError`: CoreFoundation failed to create an object.
 pub const ERR_UNSPECIFIED: OSStatus = fourcc(b"what") as OSStatus;
 
-/// `kAudioServerPlugInIOOperationWriteMix` ('rite'): the HAL handing this
-/// driver the final, already-mixed output buffer for one IO cycle to
-/// consume.
-///
-/// The value matters more than most: with anything other than Apple's
-/// `'rite'`, `senda_WillDoIOOperation` would never match a real
-/// `inOperationID`, would answer `*will = 0`, and the HAL would never call
-/// `senda_DoIOOperation` at all — the device would enumerate, start and
-/// keep time, but pass no audio. `tests/abi.rs`'s
-/// `fourcc_matches_known_constants` asserts this against the real SDK
-/// header (via `tests/abi_probe.c`) so a typo fails `cargo test`.
+/// `kAudioServerPlugInIOOperationWriteMix`. With any value but Apple's
+/// `'rite'` the device would start and keep time but pass no audio.
 const IO_OP_WRITE_MIX: u32 = fourcc(b"rite");
-/// `kAudioServerPlugInIOOperationReadInput` ('read'): the HAL asking this
-/// driver to fill in this device's input buffer for one IO cycle. Pinned
-/// against the SDK header by the same test as `IO_OP_WRITE_MIX`.
+/// `kAudioServerPlugInIOOperationReadInput`.
 const IO_OP_READ_INPUT: u32 = fourcc(b"read");
 
-// REFIID (CFUUIDBytes) is a 16-byte all-`UInt8` by-value aggregate; it lowers
-// to the same by-value ABI on both x86_64 and arm64, so the `[u8; 16]`
-// parameter here is safe despite `improper_ctypes_definitions` flagging
-// fixed-size arrays passed by value as non-FFI-safe in general.
+// REFIID is a 16-byte by-value aggregate with the same ABI on x86_64 and
+// arm64, so `[u8; 16]` by value is FFI-safe here despite the lint.
 #[allow(improper_ctypes_definitions)]
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_QueryInterface(
     s: *mut c_void,
     _uuid: [u8; 16],
     out: *mut *mut c_void,
 ) -> i32 {
-    // Apple's contract for a successful QueryInterface is to echo the same
-    // handle back: `*outInterface = inDriver`. `s` here is the
-    // `AudioServerPlugInDriverRef` (an `Interface**`) the host already holds;
-    // it must not be replaced with `driver_interface_ptr()` (an `Interface*`),
-    // which is one indirection level short and would leave the host
-    // dereferencing `_reserved` (null) as if it were the vtable pointer.
-    //
-    // SAFETY: guarded by the null check that follows; per the HAL contract
-    // `out` is then a valid, writable, pointer-aligned `*mut c_void` for the
-    // duration of this call.
+    // Echo `s`, the `Interface**` the host holds. `driver_interface_ptr()` is
+    // an `Interface*`, one level short: the host would read `_reserved` (null)
+    // as the vtable.
+    // SAFETY: `out` is null-checked below; per the HAL contract it is then a
+    // valid, writable, pointer-aligned `*mut c_void` for this call.
     if !out.is_null() {
         unsafe { *out = s };
     }
     0
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_AddRef(_s: *mut c_void) -> u32 {
     1
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_Release(_s: *mut c_void) -> u32 {
     1
 }
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_Initialize(
     _d: AudioServerPlugInDriverRef,
     _host: *const c_void,
@@ -120,8 +75,7 @@ unsafe extern "C" fn senda_Initialize(
 }
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_CreateDevice(
     _d: AudioServerPlugInDriverRef,
     _desc: CFDictionaryRef,
@@ -131,8 +85,7 @@ unsafe extern "C" fn senda_CreateDevice(
     ERR_UNSUPPORTED
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_DestroyDevice(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -140,8 +93,7 @@ unsafe extern "C" fn senda_DestroyDevice(
     ERR_UNSUPPORTED
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_AddDeviceClient(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -150,8 +102,7 @@ unsafe extern "C" fn senda_AddDeviceClient(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_RemoveDeviceClient(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -160,8 +111,7 @@ unsafe extern "C" fn senda_RemoveDeviceClient(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_PerformDeviceConfigurationChange(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -171,8 +121,7 @@ unsafe extern "C" fn senda_PerformDeviceConfigurationChange(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_AbortDeviceConfigurationChange(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -182,43 +131,24 @@ unsafe extern "C" fn senda_AbortDeviceConfigurationChange(
     OK
 }
 
-// ---- Property dispatch helpers -------------------------------------------
-//
-// Everything from here to the property vtable functions below is the only
-// place in this crate that turns raw HAL pointers into safe Rust values (or
-// back again).
-// `engine::properties` never sees a pointer — it takes `&AudioObjectPropertyAddress`
-// by value/reference and `Option<&str>`/`&[u8]` slices, and hands back a
-// logical `Value`; this module is responsible for every unsafe read/write
-// and for all CoreFoundation interop. Nothing here may panic: a panic
-// unwinding across `extern "C"` aborts `coreaudiod` and takes all system
-// audio down with it.
-
-/// Copies a `*const AudioObjectPropertyAddress` into an owned value.
+/// Copies a `*const AudioObjectPropertyAddress` into an owned value; `None` if null.
 ///
 /// # Safety contract
-/// Null-checks first. If non-null, trusts the host's contract that the
-/// pointer refers to a fully-initialised, correctly-sized
-/// `AudioObjectPropertyAddress` for the duration of this call — the
-/// standard assumption at every AudioServerPlugIn entry point.
+/// Non-null `a` is trusted, per the HAL contract, to be a valid `AudioObjectPropertyAddress` for this call.
 fn read_property_address(
     a: *const AudioObjectPropertyAddress,
 ) -> Option<AudioObjectPropertyAddress> {
     if a.is_null() {
         return None;
     }
-    // SAFETY: non-null per the check above; the type is `Copy` and repr(C),
-    // so this is a plain read of host-owned memory the host guarantees is
-    // valid and initialised for the call. The read relies on 4-byte
-    // alignment (three `u32` fields); the HAL allocates the address as its
-    // C type, so that holds.
+    // SAFETY: `a` is non-null and, per the HAL contract, points to a valid,
+    // initialised, 4-byte-aligned `AudioObjectPropertyAddress` for this call;
+    // the type is `Copy` and `repr(C)`, so this is a plain read.
     Some(unsafe { *a })
 }
 
-/// Decodes the `CFStringRef` qualifier `TranslateUIDToDevice` receives (the
-/// only property in this driver that uses a qualifier) into a `&str`
-/// borrowed from `scratch`. Returns `None` for every other property, or if
-/// decoding fails for any reason — never panics.
+/// Decodes a `CFStringRef` qualifier into a `&str` borrowed from `scratch`;
+/// `None` if it is absent, the wrong size or undecodable. Never panics.
 fn read_qualifier_str(
     qualifier_size: u32,
     qualifier_data: *const c_void,
@@ -227,17 +157,15 @@ fn read_qualifier_str(
     if qualifier_data.is_null() || qualifier_size as usize != std::mem::size_of::<CFStringRef>() {
         return None;
     }
-    // SAFETY: size-checked above to be exactly one CFStringRef-sized value,
-    // non-null; we only read it. The read relies on 8-byte (pointer)
-    // alignment; the HAL allocates the qualifier as a `CFStringRef`, so
-    // that holds.
+    // SAFETY: `qualifier_data` is non-null and exactly one `CFStringRef` in
+    // size (checked above); the HAL allocates it as a `CFStringRef`, so it
+    // is pointer-aligned. Read only.
     let cf: CFStringRef = unsafe { *(qualifier_data as *const CFStringRef) };
     if cf.is_null() {
         return None;
     }
-    // SAFETY: `cf` is a non-null CFStringRef the host owns for the duration
-    // of this call; `scratch` is a valid, appropriately-sized, writable
-    // local buffer.
+    // SAFETY: `cf` is a non-null `CFStringRef` the host owns for this call;
+    // `scratch` is a valid, writable local buffer of the length passed.
     let ok = unsafe {
         CFStringGetCString(
             cf,
@@ -256,81 +184,44 @@ fn read_qualifier_str(
     std::str::from_utf8(scratch.get(..nul)?).ok()
 }
 
-/// Reads the current machine's tick-to-nanosecond conversion ratio via
-/// `mach_timebase_info` — the number of nanoseconds one `mach_absolute_time`
-/// tick represents (not ticks per nanosecond, despite how that reads;
-/// `numer`/`denom` name it the other way round). Not RT-hot: called only
-/// from `senda_StartIO` and on a sample-rate change in
-/// `senda_SetPropertyData`, never from `senda_GetZeroTimeStamp` itself —
-/// that call only needs a raw tick reading, see
-/// `engine::clock::Clock::zero_timestamp`.
+/// Nanoseconds per `mach_absolute_time` tick. Not on the IO path: called
+/// from `senda_StartIO` and on a sample-rate change only.
 fn host_ns_per_tick() -> f64 {
     let mut info = MachTimebaseInfo::default();
-    // SAFETY: `&mut info` is a valid, uniquely-owned, correctly-sized
-    // `MachTimebaseInfo` for the duration of this call.
+    // SAFETY: `&mut info` is a valid, uniquely-owned `MachTimebaseInfo` for this call.
     let kr = unsafe { mach_timebase_info(&mut info) };
-    // `kr != 0` is a `kern_return_t` failure; `denom == 0` would divide by
-    // zero in `Clock::start`. Either way, 1 tick == 1 ns is a safe fallback
-    // rather than propagating a bogus ratio into the clock.
+    // On failure, or a `denom` that would divide by zero, 1 tick == 1 ns.
     if kr != 0 || info.denom == 0 {
         return 1.0;
     }
     f64::from(info.numer) / f64::from(info.denom)
 }
 
-/// Creates a fresh `CFStringRef` from `s`. The HAL takes ownership of the
-/// returned string, so a new one is created per call rather than reusing a
-/// cached reference this module would also need to release.
+/// A fresh `CFStringRef` per call: the HAL takes ownership of the result.
 fn cfstring_from_str(s: &str) -> CFStringRef {
     let cstr = std::ffi::CString::new(s).unwrap_or_default();
-    // SAFETY: `cstr` is a valid, NUL-terminated C string for the duration
-    // of this call; passing `NULL` as the allocator is documented by Apple
-    // to mean "use the default allocator".
+    // SAFETY: `cstr` is a valid NUL-terminated C string for this call; a
+    // `NULL` allocator means the default allocator.
     unsafe { CFStringCreateWithCString(std::ptr::null(), cstr.as_ptr(), K_CF_STRING_ENCODING_UTF8) }
 }
 
-/// Must match `CFBundleIdentifier` in `Info.plist` exactly — this is how the
-/// driver finds its own bundle at runtime to resolve `DeviceIcon.icns`.
-/// Duplicated here rather than read from the plist at build time (same
-/// trade-off already made for other cross-file constants in this project):
-/// no build-time file I/O, at the cost of the two needing to be kept in
-/// sync by hand.
+/// Must match `CFBundleIdentifier` in `Info.plist`; kept in sync by hand.
 const DRIVER_BUNDLE_ID: &str = "com.senda.link.driver";
 
-/// Resolves a `CFURLRef` to `Contents/Resources/DeviceIcon.icns` inside this
-/// driver's own bundle, for `kAudioDevicePropertyIcon`.
-///
-/// Returns `None` if the bundle isn't registered under `DRIVER_BUNDLE_ID`
-/// (e.g. running outside `coreaudiod`, as in `cargo test`) or the resource
-/// is missing — callers must map `None` to `ERR_UNSPECIFIED` rather than
-/// handing a null `CFURLRef` to the host, the same hazard `write_value`'s
-/// `Value::Str` arm guards against for `CFRelease(NULL)`.
-///
-/// CoreFoundation ownership, per call:
-/// - `bundle_id`/`name`/`ext` are Create-rule `CFStringRef`s this function
-///   makes and owns — each is released here once it is no longer needed,
-///   after a null check (`CFRelease(NULL)` crashes).
-/// - `CFBundleGetBundleWithIdentifier` is a Get-rule API: `bundle` is
-///   borrowed from CoreFoundation's registry and must never be released —
-///   doing so corrupts that registry entry for every other caller in the
-///   process.
-/// - `CFBundleCopyResourceURL` is a Copy-rule API: this function owns the
-///   returned `CFURLRef` and transfers that ownership to the caller (who, in
-///   turn, hands it to the HAL) by returning it un-released.
+/// A Copy-rule `CFURLRef` to `DeviceIcon.icns` in this driver's bundle, for
+/// `kAudioDevicePropertyIcon`; `None` if the bundle is not registered (as in
+/// `cargo test`) or the resource is missing. Ownership passes to the caller.
 fn icon_resource_url() -> Option<CFURLRef> {
     let bundle_id = cfstring_from_str(DRIVER_BUNDLE_ID);
     if bundle_id.is_null() {
         return None;
     }
-    // SAFETY: `bundle_id` is a valid, non-null CFStringRef this function
-    // just created and owns for the duration of this call.
+    // SAFETY: `bundle_id` is a non-null `CFStringRef` this function owns.
     let bundle: CFBundleRef = unsafe { CFBundleGetBundleWithIdentifier(bundle_id) };
-    // SAFETY: `bundle_id` is non-null (checked above); this function owns it
-    // (Create rule) and is done with it — `CFBundleGetBundleWithIdentifier`
-    // only reads its argument, it does not take ownership.
+    // SAFETY: `bundle_id` is non-null and Create-rule owned here; the Get
+    // call above did not take ownership.
     unsafe { CFRelease(bundle_id) };
-    // `bundle` is a Get-rule reference (see doc above) — never released,
-    // whether or not it turns out to be null.
+    // `bundle` is Get-rule: never released.
     if bundle.is_null() {
         return None;
     }
@@ -340,9 +231,8 @@ fn icon_resource_url() -> Option<CFURLRef> {
     let url = if name.is_null() || ext.is_null() {
         None
     } else {
-        // SAFETY: `bundle` is a valid, non-null, Get-rule `CFBundleRef` this
-        // function does not own (see above); `name`/`ext` are valid,
-        // non-null CFStringRefs this function owns until released below.
+        // SAFETY: `bundle` is a non-null Get-rule `CFBundleRef`; `name` and
+        // `ext` are non-null `CFStringRef`s owned here until released below.
         let url = unsafe { CFBundleCopyResourceURL(bundle, name, ext, std::ptr::null()) };
         if url.is_null() {
             None
@@ -350,9 +240,6 @@ fn icon_resource_url() -> Option<CFURLRef> {
             Some(url)
         }
     };
-    // Release whichever of `name`/`ext` were actually created, regardless of
-    // whether the lookup succeeded — these are local Create-rule references,
-    // never handed to anything else.
     if !name.is_null() {
         // SAFETY: non-null, Create-rule, owned by this function.
         unsafe { CFRelease(name) };
@@ -364,34 +251,19 @@ fn icon_resource_url() -> Option<CFURLRef> {
     url
 }
 
-/// Copies `n` bytes from `*src` into `out`. `n` is always clamped by the
-/// caller to at most `size_of::<T>()`, so the read never runs past `src`.
+/// Copies at most `size_of::<T>()` of `n` bytes from `*src` into `out`.
 ///
 /// # Safety
-/// Caller must ensure `out` is non-null and has at least `n` writable
-/// bytes.
+/// `out` must be non-null with at least `n` writable bytes.
 unsafe fn copy_out<T>(src: &T, out: *mut c_void, n: usize) {
     let n = n.min(std::mem::size_of::<T>());
     std::ptr::copy_nonoverlapping(src as *const T as *const u8, out.cast::<u8>(), n);
 }
 
-/// Serialises `value` into the host's output buffer and returns the number
-/// of bytes actually written.
-///
-/// Rejects rather than truncates: if `out_size` is smaller than
-/// `value.size_in_bytes()` for a non-zero-sized value, this returns
-/// `Err(ERR_BAD_PROPERTY_SIZE)` and writes nothing at all. Truncating
-/// instead would be actively dangerous for `Value::Str`/`Value::Url` —
-/// writing a partial `CFStringRef`/`CFURLRef` pointer into the host's buffer
-/// would leave `coreaudiod` holding (and eventually `CFRelease`-ing)
-/// garbage, and for every other variant it would silently hand back corrupt
-/// data with no way for the caller to notice. Crucially, this size check
-/// runs before the `Value::Str`/`Value::Url` arms create anything: an
-/// undersized buffer is rejected without ever calling
-/// `CFStringCreateWithCString`/`icon_resource_url`, so a truncation bug can
-/// never leak a CoreFoundation object nobody will release. A zero-sized
-/// value (`U32ArrEmpty`) is always fine to "write", regardless of `out_size`
-/// or whether `out` is null, since there is nothing to copy.
+/// Serialises `value` into the host's buffer and returns the bytes written.
+/// An undersized buffer is rejected, not truncated into: a partial
+/// `CFStringRef`/`CFURLRef` would leave `coreaudiod` releasing garbage, and
+/// the check runs before those arms create anything, so nothing can leak.
 fn write_value(value: Value, out_size: u32, out: *mut c_void) -> Result<u32, OSStatus> {
     let needed = value.size_in_bytes();
     if needed == 0 {
@@ -403,21 +275,16 @@ fn write_value(value: Value, out_size: u32, out: *mut c_void) -> Result<u32, OSS
     if (out_size as usize) < needed {
         return Err(ERR_BAD_PROPERTY_SIZE);
     }
-    // SAFETY: `out` is non-null and `needed` never exceeds `out_size`
-    // (checked above) or the source value's own size (each arm copies
-    // exactly `size_of::<T>()` bytes from a local, fully-initialised value
-    // of that same type), so every `copy_out` call stays within both
-    // buffers.
+    // SAFETY: `out` is non-null and `needed <= out_size` (checked above);
+    // each arm copies exactly `size_of::<T>()` bytes from a local,
+    // initialised value of that type, so every `copy_out` stays within both.
     unsafe {
         match value {
             Value::U32(v) => copy_out(&v, out, needed),
             Value::F64(v) => copy_out(&v, out, needed),
             Value::Str(s) => {
                 let cf = cfstring_from_str(s);
-                // `CFRelease(NULL)` crashes. If CoreFoundation failed to
-                // create the string, do not hand a null CFStringRef to the
-                // host — it will eventually try to release whatever
-                // pointer-sized value sits in this slot.
+                // A null `CFStringRef` handed to the host would be `CFRelease`d.
                 if cf.is_null() {
                     return Err(ERR_UNSPECIFIED);
                 }
@@ -425,10 +292,6 @@ fn write_value(value: Value, out_size: u32, out: *mut c_void) -> Result<u32, OSS
             }
             Value::Url => {
                 let Some(url) = icon_resource_url() else {
-                    // Bundle not registered or resource missing (see
-                    // `icon_resource_url`'s doc) — do not hand a null
-                    // CFURLRef to the host, same hazard as the `Value::Str`
-                    // arm above.
                     return Err(ERR_UNSPECIFIED);
                 };
                 copy_out(&url, out, needed);
@@ -446,11 +309,8 @@ fn write_value(value: Value, out_size: u32, out: *mut c_void) -> Result<u32, OSS
     Ok(needed as u32)
 }
 
-// ---- The property and IO vtable functions ---------------------------------
-
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_HasProperty(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -464,8 +324,7 @@ unsafe extern "C" fn senda_HasProperty(
 }
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_IsPropertySettable(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -481,8 +340,7 @@ unsafe extern "C" fn senda_IsPropertySettable(
     };
     match properties::is_property_settable(id, &addr) {
         Ok(settable) => {
-            // SAFETY: `out` was null-checked above; the host guarantees it
-            // is a valid, writable `u8` for the duration of this call.
+            // SAFETY: `out` is non-null; per the HAL contract a valid, writable `u8` for this call.
             unsafe { *out = u8::from(settable) };
             OK
         }
@@ -491,8 +349,7 @@ unsafe extern "C" fn senda_IsPropertySettable(
 }
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_GetPropertyDataSize(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -508,10 +365,8 @@ unsafe extern "C" fn senda_GetPropertyDataSize(
     let Some(addr) = read_property_address(a) else {
         return ERR_BAD_OBJECT;
     };
-    // Only decode the qualifier as a CFStringRef for the one property that
-    // actually uses one (`TranslateUIDToDevice`). Any other selector
-    // reaching here with an 8-byte qualifier (whatever it actually is) must
-    // not be blindly handed to `CFStringGetCString`.
+    // Only `TranslateUIDToDevice` takes a qualifier; any other selector's
+    // must not be handed to `CFStringGetCString`.
     let mut scratch = [0u8; 256];
     let qualifier = if addr.selector == fourcc(b"uidd") {
         read_qualifier_str(qs, q, &mut scratch)
@@ -520,8 +375,7 @@ unsafe extern "C" fn senda_GetPropertyDataSize(
     };
     match properties::get_property_data_size(id, &addr, qualifier) {
         Ok(size) => {
-            // SAFETY: `out` was null-checked above; host-guaranteed valid
-            // and writable for the duration of this call.
+            // SAFETY: `out` is non-null; per the HAL contract a valid, writable `u32` for this call.
             unsafe { *out = size as u32 };
             OK
         }
@@ -530,8 +384,7 @@ unsafe extern "C" fn senda_GetPropertyDataSize(
 }
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_GetPropertyData(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -549,7 +402,6 @@ unsafe extern "C" fn senda_GetPropertyData(
     let Some(addr) = read_property_address(a) else {
         return ERR_BAD_OBJECT;
     };
-    // See the matching comment in senda_GetPropertyDataSize.
     let mut scratch = [0u8; 256];
     let qualifier = if addr.selector == fourcc(b"uidd") {
         read_qualifier_str(qs, q, &mut scratch)
@@ -559,12 +411,10 @@ unsafe extern "C" fn senda_GetPropertyData(
     match properties::get_property_data(id, &addr, qualifier) {
         Ok(value) => match write_value(value, data_size, out) {
             Ok(written) => {
-                // SAFETY: `out_size` was null-checked above; host-guaranteed
-                // valid and writable for the duration of this call.
+                // SAFETY: `out_size` is non-null; per the HAL contract a valid, writable `u32` for this call.
                 unsafe { *out_size = written };
                 OK
             }
-            // Reject rather than truncate — see write_value's doc.
             Err(status) => status,
         },
         Err(status) => status,
@@ -572,8 +422,7 @@ unsafe extern "C" fn senda_GetPropertyData(
 }
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_SetPropertyData(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -590,37 +439,20 @@ unsafe extern "C" fn senda_SetPropertyData(
     if data.is_null() {
         return ERR_BAD_OBJECT;
     }
-    // SAFETY: `data` is non-null; per the HAL contract, `data_size` is the
-    // honest size of the allocation behind `data` for a SetPropertyData
-    // call, so a slice of at most `data_size` bytes lies within it. The
-    // 8-byte cap only bounds the copy — the largest value this driver
-    // reads out of `data` is an f64 sample rate — and is no defence against
-    // a wrong `data_size` (a `'fsiz'` set is a 4-byte allocation).
+    // SAFETY: `data` is non-null and, per the HAL contract, `data_size` is the
+    // size of the allocation behind it, so `len <= data_size` bytes lie within
+    // it. The 8-byte cap bounds the copy; it is no defence against a wrong `data_size`.
     let len = (data_size as usize).min(8);
     let slice: &[u8] = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
     let result = properties::set_property_data(id, &addr, slice);
-    // A successful NominalSampleRate change is the one event that
-    // legitimately voids this device's cached zero-timestamp timeline.
-    // `properties::set_property_data` above already validated the requested
-    // rate against `device::SAMPLE_RATES` (rejecting anything else with
-    // `ERR_ILLEGAL_VALUE`) and stored it in `STATE`, so the new rate is read
-    // back from there rather than re-parsed out of `slice` here.
-    //
+    // A successful NominalSampleRate change voids the zero-timestamp
+    // timeline; the validated rate is read back from `STATE`.
     if result.is_ok() && addr.selector == fourcc(b"nsrt") {
         if let Some(dev) = device::find_by_object_id(id) {
             if let (Some(clock), Some(state)) = (CLOCKS.get(dev), device::STATE.get(dev)) {
-                // A sample-rate change also invalidates the ring contents.
-                // The wipe is skipped while IO is running: `Ring::zero` is
-                // a second writer, and a `'nsrt'` set applies synchronously
-                // while a client's IO thread may be inside `DoIOOperation`.
-                // A live writer supersedes old content anyway, and
-                // `senda_StartIO`'s 0->1 transition zeroes unconditionally.
-                // The `io_running` load and the wipe are not atomic with
-                // respect to `StartIO` (`START_STOP_LOCKS` is not held
-                // here); the HAL is not expected to issue a `StartIO`
-                // concurrently with a rate change on this path. Only a ring
-                // that already exists is zeroed (`rings_for`, not
-                // `ensure_ring`).
+                // Skipped while IO runs: `Ring::zero` would be a second writer,
+                // and the next 0->1 `StartIO` zeroes anyway. Not atomic with
+                // respect to `StartIO`; `START_STOP_LOCKS` is not held here.
                 if !state.io_running.load(Ordering::Acquire) {
                     if let Some(ring) = io::rings_for(dev) {
                         ring.zero();
@@ -628,8 +460,6 @@ unsafe extern "C" fn senda_SetPropertyData(
                 }
                 // SAFETY: reads the monotonic tick counter; touches no memory.
                 let now = unsafe { mach_absolute_time() };
-                // `start` bumps the seed inside its own seqlock transaction, so the
-                // reset count is never observable under the old seed.
                 clock.start(now, state.rate(), host_ns_per_tick());
             }
         }
@@ -640,21 +470,10 @@ unsafe extern "C" fn senda_SetPropertyData(
     }
 }
 
-/// Serialises `senda_StartIO`/`senda_StopIO`'s ref-count transition, one
-/// lock per device (indexed identically to `device::STATE`/`clock::CLOCKS`).
-///
-/// A bare `fetch_add` on `PerDevice::client_count` identifies who won the
-/// 0->1 race but does nothing to make a losing caller wait: a second
-/// client's `StartIO` could see `prev == 1` and return `OK` before the
-/// winner's `ensure_ring`/`zero`/`clock.start`/`io_running` store had
-/// completed, leaving the HAL free to call `DoIOOperation` for that client
-/// while `io::rings_for` still returns `None` or while `Ring::zero` is
-/// mid-flight. The lock is therefore held across the whole transition.
-/// Apple's NullAudio sample holds a mutex across the same transition.
-///
-/// `std::sync::Mutex` is fine here: the "no `Mutex`" constraint binds
-/// `engine::` only, and this lock is never touched on the `DoIOOperation`
-/// path.
+/// Serialises the `StartIO`/`StopIO` ref-count transition, one lock per
+/// device: a bare `fetch_add` would let a second client return `OK` before
+/// the winner's ring and clock setup completed. NullAudio holds a mutex
+/// across the same transition. Never touched on the IO path.
 static START_STOP_LOCKS: [std::sync::Mutex<()>; 5] = [
     std::sync::Mutex::new(()),
     std::sync::Mutex::new(()),
@@ -664,55 +483,30 @@ static START_STOP_LOCKS: [std::sync::Mutex<()>; 5] = [
 ];
 
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_StartIO(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
     _c: u32,
 ) -> OSStatus {
-    // The HAL calls `StartIO` once per client attaching to a device, not
-    // once overall (mirroring Apple's own NullAudio.c sample: it keeps its
-    // own `gDevice_IOIsRunning` ref count and only resets its anchor time
-    // when that count is going from 0 to 1) — a second client's `StartIO`
-    // must not reset a timeline, or wipe a ring, the first client is
-    // already relying on. `client_count` is that ref count; only the
-    // transition out of zero (re)anchors the clock and (re)zeroes the
-    // ring. An unrecognised `id` is not an error here — the HAL is not
-    // required to have queried this device through the property-dispatch
-    // path first — it is simply a no-op.
+    // `StartIO` arrives once per client; only the 0->1 transition (re)anchors
+    // the clock and zeroes the ring. An unknown `id` is a no-op, not an error.
     if let Some(dev) = device::find_by_object_id(id) {
         if let Some(state) = device::STATE.get(dev) {
             if let Some(lock) = START_STOP_LOCKS.get(dev) {
-                // Held across the entire fetch_add + conditional setup
-                // below, not just the "did I win" check — see the doc
-                // comment on `START_STOP_LOCKS` for why a losing caller
-                // must not be able to proceed (and return `OK`) before the
-                // winner's setup has fully completed. A poisoned lock
-                // (only reachable if an earlier holder panicked while
-                // holding it, which nothing in this block can do — no
-                // `unwrap`/`expect`/`panic!`/indexing here) is recovered
-                // rather than propagated: this function must never panic
-                // across the `extern "C"` boundary either way.
+                // Held across the whole transition. A poisoned lock is
+                // recovered, never propagated: no panic may cross `extern "C"`.
                 let _guard = lock
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let prev = state.client_count.fetch_add(1, Ordering::AcqRel);
                 if prev == 0 {
-                    // Not real-time: `StartIO` is a control-thread call. A
-                    // freshly created `Ring` already reads as "nothing
-                    // written" (see `io::ensure_ring`'s doc comment), but a
-                    // `Ring` reused from an earlier session must be wiped so
-                    // this session never inherits the previous one's audio —
-                    // `Ring::zero`'s own doc comment is why that call belongs
-                    // here (a control-thread transition, no writer yet active
-                    // for this session) and never on the `DoIOOperation` path.
+                    // A reused `Ring` must not carry the previous session's audio.
                     if let Some(ring) = io::ensure_ring(dev) {
                         ring.zero();
                     }
                     if let Some(clock) = CLOCKS.get(dev) {
-                        // SAFETY: reads the monotonic tick counter; touches no
-                        // memory.
+                        // SAFETY: reads the monotonic tick counter; touches no memory.
                         let now = unsafe { mach_absolute_time() };
                         clock.start(now, state.rate(), host_ns_per_tick());
                     }
@@ -724,23 +518,14 @@ unsafe extern "C" fn senda_StartIO(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_StopIO(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
     _c: u32,
 ) -> OSStatus {
-    // Mirrors `senda_StartIO`'s ref-count transition: only the last client
-    // detaching (count 1 -> 0) marks the device as no longer running.
-    // `fetch_update` rather than a bare `fetch_sub` — a `StopIO` without a
-    // matching prior `StartIO` is not something the HAL's contract
-    // permits, but this must never wrap `client_count` around to
-    // `u32::MAX` (nor panic) if it somehow happened anyway; `checked_sub`
-    // simply declines the update in that case. Guarded by the same
-    // per-device lock as `senda_StartIO` (see its doc comment on
-    // `START_STOP_LOCKS`) so a `StopIO` can never interleave with an
-    // in-flight `StartIO` transition for the same device.
+    // Only the last client (1->0) clears `io_running`. `checked_sub` declines
+    // an unmatched `StopIO` rather than wrapping; same lock as `StartIO`.
     if let Some(dev) = device::find_by_object_id(id) {
         if let Some(state) = device::STATE.get(dev) {
             if let Some(lock) = START_STOP_LOCKS.get(dev) {
@@ -760,8 +545,7 @@ unsafe extern "C" fn senda_StopIO(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_GetZeroTimeStamp(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -776,16 +560,12 @@ unsafe extern "C" fn senda_GetZeroTimeStamp(
     let Some(clock) = CLOCKS.get(dev) else {
         return ERR_BAD_OBJECT;
     };
-    // SAFETY: reads the monotonic tick counter; touches no memory. This is
-    // the only clock read on the IO-thread hot path — `engine::clock::Clock`
-    // itself never calls into FFI, per the "no unsafe in engine/" rule.
+    // SAFETY: reads the monotonic tick counter; touches no memory.
     let now = unsafe { mach_absolute_time() };
     let (sample_time, host_time, seed_val) = clock.zero_timestamp(now);
     if !st.is_null() {
-        // SAFETY: host-guaranteed valid, writable `f64` for the duration of
-        // this call (standard AudioServerPlugIn out-param contract). The
-        // write relies on 8-byte alignment; the HAL allocates `st`, `ht`
-        // and `seed` as their C types (`Float64`/`UInt64`), so that holds.
+        // SAFETY: per the HAL out-param contract `st`, `ht` and `seed` are
+        // valid, writable, 8-byte-aligned `Float64`/`UInt64` for this call.
         unsafe { *st = sample_time };
     }
     if !ht.is_null() {
@@ -799,8 +579,7 @@ unsafe extern "C" fn senda_GetZeroTimeStamp(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_WillDoIOOperation(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -809,27 +588,13 @@ unsafe extern "C" fn senda_WillDoIOOperation(
     will: *mut u8,
     will_do_in_place: *mut u8,
 ) -> OSStatus {
-    // This driver only ever participates in the two operations
-    // `senda_DoIOOperation` implements — everything else (the IO
-    // thread/cycle bookkeeping operations, `ConvertInput`/`ProcessOutput`,
-    // etc.) is declined with `*will = 0`.
-    //
-    // The second out-parameter is `outWillDoInPlace`, not a direction
-    // flag. Apple's header (`AudioServerPlugIn.h`): "a Boolean where true
-    // indicates that the device will perform the requested operation
-    // entirely within the main buffer passed to the DoIOOperation routine.
-    // If this value is false, it indicates that the device requires that
-    // the secondary buffer be passed." `senda_DoIOOperation` never touches
-    // the secondary buffer, only `main`, so in-place is true by
-    // construction for both declared operations; Apple's NullAudio sample
-    // and BlackHole answer `true` for both as well. `will_do`/`in_place`
-    // are therefore identical in every case that isn't a decline — a
-    // single condition, not a branch per operation with two identical arms.
+    // Only the two operations `senda_DoIOOperation` implements are declared.
+    // The second out-param is `outWillDoInPlace`, not a direction flag; only
+    // `main` is ever touched, so it is true for both, as in NullAudio and BlackHole.
     let declared = op == IO_OP_WRITE_MIX || op == IO_OP_READ_INPUT;
     let (will_do, in_place) = if declared { (1u8, 1u8) } else { (0u8, 0u8) };
     if !will.is_null() {
-        // SAFETY: host-guaranteed valid, writable `u8` for the duration of
-        // this call (standard AudioServerPlugIn out-param contract).
+        // SAFETY: per the HAL out-param contract, a valid, writable `u8` for this call.
         unsafe { *will = will_do };
     }
     if !will_do_in_place.is_null() {
@@ -839,8 +604,7 @@ unsafe extern "C" fn senda_WillDoIOOperation(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_BeginIOOperation(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -852,8 +616,7 @@ unsafe extern "C" fn senda_BeginIOOperation(
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_DoIOOperation(
     _d: AudioServerPlugInDriverRef,
     id: AudioObjectID,
@@ -865,11 +628,7 @@ unsafe extern "C" fn senda_DoIOOperation(
     main: *mut c_void,
     _sec: *mut c_void,
 ) -> OSStatus {
-    // Null-check first, per contract — return OK without touching audio
-    // rather than dereferencing a null `AudioServerPlugInIOCycleInfo*` or
-    // main-buffer pointer. `cycle_info` carries the HAL's sample time for
-    // the cycle, which is what the loopback ring is indexed by; without it
-    // there is nothing useful to do.
+    // Without `cycle_info`'s sample time there is nothing to index the ring by.
     if cycle_info.is_null() || main.is_null() {
         return OK;
     }
@@ -884,25 +643,16 @@ unsafe extern "C" fn senda_DoIOOperation(
     };
     let channels = cfg.channels as usize;
 
-    // SAFETY: `cycle_info` is non-null (checked above) and, per the HAL's
-    // `DoIOOperation` contract, points to a valid, fully initialised
-    // `AudioServerPlugInIOCycleInfo` for the duration of this call.
-    // `AudioServerPlugInIOCycleInfo` is `Copy`, so this is a plain read of
-    // host-owned memory, not a pointer retained past this call. The read
-    // relies on 8-byte alignment (`u64`/`f64` fields); the HAL allocates
-    // the struct as its C type, so that holds.
+    // SAFETY: `cycle_info` is non-null and, per the HAL contract, points to a
+    // valid, initialised, 8-byte-aligned `AudioServerPlugInIOCycleInfo` for
+    // this call; the type is `Copy`, so this is a plain read.
     let info = unsafe { *cycle_info };
 
-    // The HAL-supplied frame count (`n`, `inIOBufferFrameSize`) is clamped
-    // to `MAX_BUFFER_FRAMES`, the ceiling advertised via `'fsz#'`: the ring
-    // cannot honour more frames than that, and the clamp bounds the slice
-    // constructed below whatever `n` claims. The bound is the driver-wide
-    // ceiling, not this device's `'fsiz'`-negotiated size — `n` is the
-    // maximum across every attached client, so one client narrowing
-    // `'fsiz'` must not truncate the others' audio.
+    // `n` is clamped to `MAX_BUFFER_FRAMES` (the `'fsz#'` ceiling), bounding
+    // the slice below whatever `n` claims. Not to this device's `'fsiz'`: `n`
+    // is the maximum across clients, so one narrowing must not truncate the rest.
     if (n as usize) > device::MAX_BUFFER_FRAMES as usize {
-        // A clamp that silently truncates audio is invisible in practice,
-        // so it is counted (`PerDevice::frame_clamps`).
+        // A silent clamp is invisible in practice, so it is counted.
         state.record_frame_clamp();
     }
     let frames = (n as usize).min(device::MAX_BUFFER_FRAMES as usize);
@@ -914,40 +664,26 @@ unsafe extern "C" fn senda_DoIOOperation(
     };
 
     if op == IO_OP_WRITE_MIX {
-        // `f64 as u64` saturates (negative -> 0, NaN -> 0, too-large ->
-        // u64::MAX) rather than wrapping or invoking UB — plain Rust `as`
-        // semantics, no explicit clamp needed.
+        // `f64 as u64` saturates; no explicit clamp needed.
         let sample_time = info.output_time.sample_time as u64;
-        // SAFETY: `main` is non-null (checked above). Per the HAL's
-        // `DoIOOperation` contract, `io_main_buffer` for a `WriteMix`
-        // operation holds at least `n * channels` valid `f32` samples in
-        // this device's stream format, and `f32` alignment of `main` is
-        // part of that contract. `frames <= n` after the clamp above, so
-        // `len` never exceeds what the HAL sized the call for.
+        // SAFETY: `main` is non-null; per the HAL's `DoIOOperation` contract
+        // it holds at least `n * channels` valid, `f32`-aligned samples, and
+        // `frames <= n` after the clamp, so `len` never exceeds that.
         let src = unsafe { std::slice::from_raw_parts(main.cast::<f32>(), len) };
-        // No sanitising, no clamping, no gain: bit-transparency is a
-        // global constraint, and `Ring::write` already preserves every bit
-        // pattern (NaN payloads, denormals, signed zero, infinities)
-        // exactly.
+        // No sanitising or gain: `Ring::write` preserves every bit pattern.
         io::on_write_mix(dev, sample_time, src, frames);
     } else if op == IO_OP_READ_INPUT {
         let sample_time = info.input_time.sample_time as u64;
-        // SAFETY: same contract as the `WriteMix` arm above, except this
-        // operation writes into the host's buffer rather than reading from
-        // it. The slice is exclusive for the call: the HAL does not touch
-        // the buffer while `DoIOOperation` is running.
+        // SAFETY: as the `WriteMix` arm, but written; the HAL does not touch
+        // the buffer while `DoIOOperation` runs, so the slice is exclusive.
         let dst = unsafe { std::slice::from_raw_parts_mut(main.cast::<f32>(), len) };
         io::on_read_input(dev, sample_time, dst, frames);
     }
-    // Any other operation ID: `senda_WillDoIOOperation` never declares
-    // `*will = 1` for it, so the HAL should never route it here — declining
-    // silently (rather than erroring) matches this driver's existing
-    // stance on calls outside its declared contract.
+    // Any other operation was never declared in `WillDoIOOperation`; decline silently.
     OK
 }
 /// # Safety
-/// Called by the HAL through the vtable. Every pointer argument must be valid for
-/// the use the AudioServerPlugIn contract documents for this entry point.
+/// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_EndIOOperation(
     _d: AudioServerPlugInDriverRef,
     _id: AudioObjectID,
@@ -985,9 +721,7 @@ static mut DRIVER_INTERFACE: AudioServerPlugInDriverInterface = AudioServerPlugI
     EndIOOperation: senda_EndIOOperation,
 };
 
-/// A `static` holding a raw pointer would need a `Sync` wrapper, so the
-/// pointer is produced by a function instead; returning the address of the
-/// static interface has identical semantics.
+/// A `static` raw pointer would need a `Sync` wrapper; a function is equivalent.
 pub fn driver_interface_ptr() -> *mut AudioServerPlugInDriverInterface {
     &raw mut DRIVER_INTERFACE
 }
@@ -998,26 +732,17 @@ mod tests {
 
     #[test]
     fn error_constants_match_the_documented_decimal_values() {
-        // Self-check on the `fourcc`-derived constants, rather than trusting
-        // hand arithmetic: each is pinned against the decimal value Apple's
-        // headers give, so a change to how a constant is spelled can never
-        // silently change the wire value a real HAL would see.
         assert_eq!(ERR_BAD_PROPERTY_SIZE, 561211770);
         assert_eq!(ERR_UNKNOWN_PROPERTY, 2003332927);
         assert_eq!(ERR_UNSUPPORTED, 1970171760);
         assert_eq!(ERR_BAD_OBJECT, 560947818);
     }
 
-    // write_value must reject an undersized buffer rather than
-    // truncate into it, and must write exactly `size_in_bytes()` bytes —
-    // never more, never fewer — whenever the buffer is big enough.
     #[test]
     fn write_value_rejects_undersized_out_size_and_writes_exact_bytes_when_sufficient() {
         const POISON: u8 = 0xAA;
         let mut buf = [POISON; 32];
 
-        // out_size = 0: Value::U32 needs 4 bytes, so this is rejected and
-        // the buffer is left completely untouched.
         let out = buf.as_mut_ptr().cast::<c_void>();
         assert_eq!(
             write_value(Value::U32(0x1122_3344), 0, out),
@@ -1025,23 +750,18 @@ mod tests {
         );
         assert_eq!(buf, [POISON; 32]);
 
-        // out_size = 4: exact fit.
         let out = buf.as_mut_ptr().cast::<c_void>();
         assert_eq!(write_value(Value::U32(0x1122_3344), 4, out), Ok(4));
         assert_eq!(&buf[..4], 0x1122_3344_u32.to_ne_bytes().as_slice());
         assert_eq!(&buf[4..], [POISON; 28].as_slice());
 
-        // out_size = 8: more room than needed; still writes exactly 4
-        // bytes, not 8.
         buf = [POISON; 32];
         let out = buf.as_mut_ptr().cast::<c_void>();
         assert_eq!(write_value(Value::U32(0x5566_7788), 8, out), Ok(4));
         assert_eq!(&buf[..4], 0x5566_7788_u32.to_ne_bytes().as_slice());
         assert_eq!(&buf[4..], [POISON; 28].as_slice());
 
-        // out_size = 64: far more room than the real 32-byte buffer even
-        // has, but write_value only ever copies `needed` (4) bytes — the
-        // inflated out_size never turns into an out-of-bounds write.
+        // out_size = 64 overstates the real 32-byte buffer; only `needed` bytes are copied.
         buf = [POISON; 32];
         let out = buf.as_mut_ptr().cast::<c_void>();
         assert_eq!(write_value(Value::U32(0x99AA_BBCC), 64, out), Ok(4));
@@ -1064,12 +784,6 @@ mod tests {
         );
     }
 
-    // An undersized buffer must be rejected before
-    // `Value::Url`'s arm ever calls `icon_resource_url` (which would create
-    // CoreFoundation objects that then leak). `out_size = 4 < 8` is checked
-    // unconditionally ahead of the match in `write_value`, so this holds
-    // regardless of whether a driver bundle is registered in this process —
-    // the buffer stays untouched either way.
     #[test]
     fn write_value_rejects_undersized_buffer_for_icon_url_before_creating_anything() {
         const POISON: u8 = 0xAA;
@@ -1079,13 +793,7 @@ mod tests {
         assert_eq!(buf, [POISON; 8]);
     }
 
-    // In the `cargo test` process, no CFBundle is registered under
-    // `DRIVER_BUNDLE_ID` (that registration only happens when `coreaudiod`
-    // actually loads the built `.driver` bundle), so `icon_resource_url`
-    // deterministically returns `None` here. This exercises the "bundle not
-    // found" branch and confirms
-    // `write_value` reports `ERR_UNSPECIFIED` rather than writing a null
-    // `CFURLRef` into the host's buffer.
+    // No bundle is registered under `DRIVER_BUNDLE_ID` in the `cargo test` process.
     #[test]
     fn write_value_of_icon_url_is_unspecified_when_the_driver_bundle_is_not_registered() {
         assert!(icon_resource_url().is_none());
@@ -1094,16 +802,8 @@ mod tests {
         assert_eq!(write_value(Value::Url, 8, out), Err(ERR_UNSPECIFIED));
     }
 
-    // A qualifier is only ever decoded for TranslateUIDToDevice. This
-    // doesn't call the real CFString-decoding path (that needs a live
-    // CFStringRef), but it pins down that non-'uidd' selectors reaching
-    // senda_GetPropertyDataSize/senda_GetPropertyData never even attempt
-    // it, regardless of what garbage sits in the qualifier pointer/size.
     #[test]
     fn get_property_data_size_ignores_qualifier_for_non_uidd_selectors() {
-        // An 8-byte qualifier that is NOT a valid CFStringRef (a bogus
-        // non-null pointer value). If this were passed to
-        // CFStringGetCString for a non-'uidd' property, it would crash.
         let bogus: u64 = 0xDEAD_BEEF_DEAD_BEEF;
         let addr = AudioObjectPropertyAddress {
             selector: fourcc(b"dev#"),
@@ -1111,9 +811,6 @@ mod tests {
             element: 0,
         };
         let mut out: u32 = 0;
-        // AudioObjectID 1 == kAudioObjectPlugInObject (device::PLUGIN_OBJECT_ID);
-        // hardcoded here rather than imported to keep this ffi-layer test
-        // from depending on engine::device internals.
         let status = unsafe {
             senda_GetPropertyDataSize(
                 std::ptr::null_mut(),
@@ -1128,13 +825,6 @@ mod tests {
         assert_eq!(status, OK);
         assert_eq!(out, 20); // DeviceList: 5 AudioObjectIDs
     }
-
-    // ---- Clock wiring ------------------------------------------------------
-    //
-    // `STATE` and `CLOCKS` are process-global `static`s and `cargo test` runs
-    // tests concurrently in one process, so each test below claims a device
-    // index no other test in the crate mutates the NominalSampleRate of
-    // (`engine::properties`'s tests already own id 50 / index 4).
 
     #[test]
     fn get_zero_time_stamp_rejects_unknown_device_and_leaves_outputs_untouched() {
@@ -1195,8 +885,6 @@ mod tests {
             "seed must not change without an explicit rate change"
         );
 
-        // The 0->1 transition above must have set `io_running`; this checks
-        // the value by number, not only its size.
         let running = AudioObjectPropertyAddress {
             selector: fourcc(b"goin"),
             scope: 0,
@@ -1207,11 +895,6 @@ mod tests {
             "io_running must be set true after StartIO's 0->1 transition"
         );
 
-        // A second `StartIO` on an already-running device (`client_count`
-        // going 1->2, not 0->1) must be a silent no-op with respect to the
-        // clock: only the first client's `StartIO` may (re)anchor the
-        // timeline. An unconditional `Clock::start` would reset `st` to 0
-        // and change `seed` here.
         assert_eq!(unsafe { senda_StartIO(std::ptr::null_mut(), 30, 0) }, OK);
         let mut st3 = -1.0_f64;
         let mut ht3 = 0_u64;
@@ -1231,12 +914,6 @@ mod tests {
             "a second StartIO on an already-running device must not re-anchor the clock"
         );
 
-        // ZeroTimeStampPeriod equals the clock advance period, and neither
-        // changes when a client alters the buffer size. Drive `'fsiz'`
-        // through the real `senda_SetPropertyData` entry point on a device
-        // with IO already running, then confirm both that `'ring'`
-        // (ZeroTimeStampPeriod) still reads back `RING_FRAMES` and that
-        // `senda_GetZeroTimeStamp`'s advance period is unmoved.
         let fsiz_addr = AudioObjectPropertyAddress {
             selector: fourcc(b"fsiz"),
             scope: 0,
@@ -1359,9 +1036,6 @@ mod tests {
             "seed must change so the HAL discards its cached timeline"
         );
 
-        // The ref-count state machine's other transition: `client_count`
-        // goes 1->0 here (from the single `StartIO` above), which must
-        // clear `io_running`.
         let running = AudioObjectPropertyAddress {
             selector: fourcc(b"goin"),
             scope: 0,
@@ -1377,14 +1051,7 @@ mod tests {
             "StopIO's 1->0 transition must clear io_running"
         );
 
-        // An unmatched StopIO (client_count already 0) must decline rather
-        // than wrapping client_count to u32::MAX — the `checked_sub` guard
-        // at `senda_StopIO`. Not directly observable as a return value
-        // (StopIO always answers OK per the HAL's contract), so this is
-        // proven indirectly: if the counter had wrapped, the very next
-        // StartIO's `fetch_add` would land on a nonzero `prev`
-        // (`u32::MAX`, not `0`) and would therefore not re-arm
-        // `io_running` below.
+        // An unmatched StopIO must not wrap `client_count`; a wrapped count would stop the next StartIO re-arming.
         assert_eq!(unsafe { senda_StopIO(std::ptr::null_mut(), 40, 0) }, OK);
         assert!(
             matches!(properties::device_property(3, &running), Ok(Value::U32(0))),
@@ -1397,16 +1064,9 @@ mod tests {
         );
     }
 
-    // Uses device id 20 (index 1) — only ever used elsewhere for BufferFrameSize
-    // (a different STATE field, and this path never reaches the clock at all
-    // since the rate is rejected before `properties::set_property_data`
-    // returns `Ok`).
+    // Uses device id 20 (index 1); the rejected rate never reaches its clock.
     #[test]
     fn set_property_data_rejects_unsupported_rate_without_touching_the_clock() {
-        // Read the clock before and after, so this test verifies its own
-        // name: checking only the rejection status could not catch a
-        // regression that bumped the seed unconditionally, regardless of
-        // whether the rate was accepted.
         let mut st_before = -1.0_f64;
         let mut ht_before = 0_u64;
         let mut seed_before = 0_u64;
@@ -1467,26 +1127,9 @@ mod tests {
         );
     }
 
-    // ---- IO path wiring ----------------------------------------------------
-    //
-    // `STATE`/`CLOCKS`/`engine::io`'s ring registry are process-global
-    // `static`s and `cargo test` runs tests concurrently in one process, so
-    // a test that calls `senda_StartIO` on device index N is the only test
-    // in the crate to start IO on N. Indices 2 and 3 belong to the
-    // clock-wiring tests above and index 1 to `engine::io`'s tests, leaving
-    // 0 (id 10, 2ch) and 4 (id 50, 128ch); `engine::properties`'s id-50
-    // test never starts IO, so it cannot race index 4 here.
-    //
-    // `senda_StartIO` is transition-sensitive: only the 0->1 transition
-    // (re)anchors the clock and zeroes the ring, so a second call on the
-    // same index is a 1->2 no-op. Do not add a test that calls it on an
-    // index another test owns expecting a fresh 0->1 transition.
+    // A test that starts IO on device index N is the only test in the crate to do so.
 
-    /// Builds a minimal `AudioServerPlugInIOCycleInfo` carrying exactly one
-    /// populated timestamp — `output_time` for a `WriteMix` cycle,
-    /// `input_time` for a `ReadInput` one — matching what
-    /// `senda_DoIOOperation` actually reads. Every other field is a benign
-    /// zero; nothing under test consults them.
+    /// One populated timestamp: `output_time` for `WriteMix`, `input_time` for `ReadInput`.
     fn cycle_info_with(sample_time: f64, is_input: bool) -> AudioServerPlugInIOCycleInfo {
         let ts = AudioTimeStamp {
             sample_time,
@@ -1511,10 +1154,6 @@ mod tests {
 
     #[test]
     fn will_do_io_operation_declares_wmix_and_rinp_and_declines_everything_else() {
-        // `IO_OP_WRITE_MIX`/`IO_OP_READ_INPUT` hold Apple's `'rite'`/`'read'`,
-        // and the second out-param is `outWillDoInPlace` — always `1` for
-        // both operations this driver declares, since `senda_DoIOOperation`
-        // only ever touches the main buffer.
         let mut will = 9u8;
         let mut will_do_in_place = 9u8;
         assert_eq!(
@@ -1578,7 +1217,6 @@ mod tests {
             "an undeclared operation must be declined"
         );
 
-        // Null out-params must not crash.
         assert_eq!(
             unsafe {
                 senda_WillDoIOOperation(
@@ -1594,14 +1232,12 @@ mod tests {
         );
     }
 
-    // Exclusive to device id 50 (index 4, 128ch) — see this section's
-    // module-level exclusivity note above.
+    // Exclusive to device id 50 (index 4, 128ch).
     #[test]
     fn do_io_operation_indexes_by_hal_sample_time_and_bounds_untrusted_frame_counts() {
         assert_eq!(unsafe { senda_StartIO(std::ptr::null_mut(), 50, 0) }, OK);
         let channels = 128usize;
 
-        // Null cycle_info: OK, no-op — never dereferenced.
         let mut buf = vec![1.0f32; device::BLOCK * channels];
         assert_eq!(
             unsafe {
@@ -1620,7 +1256,6 @@ mod tests {
             OK
         );
 
-        // Null main buffer: OK, no-op — never dereferenced.
         let info_zero = cycle_info_with(0.0, false);
         assert_eq!(
             unsafe {
@@ -1639,11 +1274,6 @@ mod tests {
             OK
         );
 
-        // Two `WriteMix` cycles at different HAL-provided sample times must
-        // land at independently addressable offsets. If `senda_DoIOOperation`
-        // ignored `cycle_info` (always used sample_time == 0, say), the
-        // second write below would clobber the first and `dst_a` would come
-        // back `2.0`, not `1.0`.
         let block = device::BLOCK as u64;
         let mut src_a = vec![1.0f32; device::BLOCK * channels];
         let mut src_b = vec![2.0f32; device::BLOCK * channels];
@@ -1729,15 +1359,6 @@ mod tests {
             "sample time BLOCK must read back the SECOND write, at its own independent offset"
         );
 
-        // Frame-count clamping: `n` must never be trusted past the driver's
-        // hard ceiling (`MAX_BUFFER_FRAMES`, advertised via `'fsz#'`). The
-        // buffer passed in is allocated to `MAX_BUFFER_FRAMES * channels`
-        // plus one extra frame of canary, so constructing the raw slice
-        // inside `senda_DoIOOperation` stays memory-safe whether or not the
-        // clamp is correct; the canary just past the ceiling is what detects
-        // a broken clamp. The clamp bounds against the driver-wide ceiling,
-        // not this device's `'fsiz'`-negotiated size — the round trip after
-        // this proves why.
         let max_len = device::MAX_BUFFER_FRAMES as usize * channels;
         let mut dst = vec![9.0f32; max_len + channels];
         for slot in dst.iter_mut().skip(max_len) {
@@ -1765,23 +1386,12 @@ mod tests {
             "a corrupt/hostile HAL frame count must not be trusted past this driver's own hard \
              ceiling (MAX_BUFFER_FRAMES)"
         );
-        // The clamp must also be counted, not just silently applied. Device
-        // index 4 is exclusive to this test (see the section note), so this
-        // reads back exactly the one clamp event the call above produced.
         assert_eq!(
             device::STATE.get(4).map(device::PerDevice::frame_clamps),
             Some(1),
             "a corrupt/hostile HAL frame count must be recorded, not just silently clamped"
         );
 
-        // A client-settable negotiated buffer size must never bound the RT
-        // frame clamp. Were `n` clamped to `buffer_frames()` instead of
-        // `MAX_BUFFER_FRAMES`, `round_trip` would come back with only its
-        // first 64 frames (`3.0`) written and the remaining 448 left at
-        // `POISON`: client B narrows `'fsiz'` to 64 while the HAL keeps
-        // running BLOCK-frame (512) cycles for client A, so 448 of every
-        // 512 frames would never reach the ring at all, with no `Ring`
-        // counter able to see it.
         let fsiz_addr = AudioObjectPropertyAddress {
             selector: fourcc(b"fsiz"),
             scope: 0,
@@ -1811,9 +1421,6 @@ mod tests {
         );
 
         const POISON: f32 = -555.0;
-        // A sample time far from every other offset this test already
-        // wrote to (0 and `block`), so this round trip cannot alias an
-        // earlier write.
         let far_block = 10 * block;
         let mut src = vec![3.0f32; device::BLOCK * channels];
         let write_info = cycle_info_with(far_block as f64, false);
@@ -1861,31 +1468,9 @@ mod tests {
         );
     }
 
-    // Exclusive to device id 10 (index 0, 2ch) — see this section's note
-    // above. Reproduces, through the real `senda_DoIOOperation` FFI
-    // boundary (raw pointers, HAL-shaped `AudioServerPlugInIOCycleInfo`
-    // values) rather than `Ring`'s own methods, the loopback scenario the
-    // ring exists for: one writer and two readers sharing a device.
-    //
-    // Each `WriteMix` cycle fills its buffer with `due_block as f32 + 1.0`
-    // — the sample time it is writing at, offset by one so block 0's
-    // marker never collides with `0.0`, the "nothing delivered here"
-    // sentinel (see `cleanly_delivered` below). Each `ReadInput` cycle
-    // checks that whenever it receives a fully, cleanly delivered block
-    // (every sample identical and nonzero — a partially covered or faded
-    // block never looks like this; see `engine::ring`'s coverage and
-    // fading docs), that value equals the requested sample time, not
-    // merely "some audio". A constant-content buffer could not tell
-    // correct `cycle_info` indexing apart from every cycle aliasing onto
-    // one fixed slot; this design does.
-    //
-    // The reader loop is bounded by wall-clock time, not a fixed iteration
-    // count: cheap 2-channel calls can finish well inside the `lag_blocks`
-    // warm-up window in an optimised build, leaving every request clamped
-    // to sample time 0. 450ms clears the 20-block (~213ms) lag in both
-    // debug and release profiles. 48kHz pacing, 20-block reader lag and
-    // 20ms warm-up are the values already proven non-flaky by
-    // `engine::ring::tests::concurrent_writer_and_reader_never_produce_a_silent_gap`.
+    // Exclusive to device id 10 (index 0, 2ch). Each write's marker is its
+    // sample time + 1, so a cleanly delivered block proves which cycle it came
+    // from; 450ms clears the 20-block reader lag in debug and release builds.
     #[test]
     fn do_io_operation_lets_a_writer_and_two_readers_run_concurrently() {
         assert_eq!(unsafe { senda_StartIO(std::ptr::null_mut(), 10, 0) }, OK);
@@ -1903,10 +1488,6 @@ mod tests {
             while !stop_w.load(Ordering::Relaxed) {
                 let due_block = (epoch.elapsed().as_secs_f64() * RATE) as u64 / block * block;
                 if last_written != Some(due_block) {
-                    // The marker: exactly the sample time this cycle
-                    // claims to be writing at (+1, see above), so a
-                    // reader can check it got back what it actually
-                    // asked for, not merely "some real audio".
                     buf.fill(due_block as f32 + 1.0);
                     let info = cycle_info_with(due_block as f64, false);
                     unsafe {
@@ -1936,21 +1517,12 @@ mod tests {
         let mut readers = Vec::new();
         for _ in 0..2 {
             readers.push(std::thread::spawn(move || {
-                // A sentinel outside the fade's reachable range. Every real
-                // value in this test — a marker (`due_block as f32 + 1.0`,
-                // always >= 1.0) or anything `fade_span` decays it towards
-                // (always in `[0, marker]`, per `engine::ring`'s fading
-                // docs) — is non-negative, so a negative sentinel can never
-                // be confused with delivered content, unlike a positive
-                // value real content could pass through while decaying.
+                // Negative, since every delivered or faded value is >= 0.
                 const SENTINEL: f32 = -999.0;
                 let mut dst = vec![SENTINEL; device::BLOCK * channels];
                 let mut delivered_correct = 0u64;
                 let mut wrong_value_delivered = 0u64;
                 let mut sentinel_leaks = 0u64;
-                // Safety cap on iterations alongside the time bound, so a
-                // pathologically fast machine cannot spin far past what
-                // this test actually needs.
                 let mut iterations = 0u64;
                 while epoch.elapsed() < run_for && iterations < 500_000 {
                     iterations += 1;

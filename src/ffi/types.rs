@@ -1,5 +1,7 @@
-//! Hand-written declarations mirroring <CoreAudio/AudioServerPlugIn.h>.
-//! Verified against Apple's header by tests/abi_probe.c — see tests/abi.rs.
+//! Hand-written mirror of `<CoreAudio/AudioServerPlugIn.h>` plus the few
+//! CoreFoundation and Mach entry points the driver needs. Every size, offset
+//! and four-character code is verified against Apple's headers by
+//! `tests/abi_probe.c`, driven from `tests/abi.rs`.
 
 use std::ffi::{c_char, c_void};
 
@@ -11,14 +13,7 @@ pub type AudioObjectPropertyElement = u32;
 pub type CFStringRef = *const c_void;
 pub type CFAllocatorRef = *const c_void;
 pub type CFDictionaryRef = *const c_void;
-/// A CFBundle reference. Only ever obtained via
-/// `CFBundleGetBundleWithIdentifier` in this driver — a Get-rule API, so
-/// every `CFBundleRef` this driver touches is borrowed, never owned/released.
 pub type CFBundleRef = *const c_void;
-/// A CFURL reference, e.g. the `kAudioDevicePropertyIcon` payload. Same
-/// pointer-sized representation as `CFStringRef`; kept as a distinct alias
-/// so call sites read as "this is a URL", not "this happens to also be a
-/// void pointer".
 pub type CFURLRef = *const c_void;
 pub type Pid = i32;
 
@@ -26,18 +21,12 @@ pub const fn fourcc(s: &[u8; 4]) -> u32 {
     ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
 }
 
-/// `kCFStringEncodingUTF8`, the only encoding this driver ever hands to
-/// `CFStringCreateWithCString`.
 pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
-// CoreFoundation entry points needed to turn a Rust `&str` into the
-// `CFStringRef` the HAL expects for string-typed properties (Name,
-// Manufacturer, DeviceUID, ModelUID, ResourceBundle) and to read the
-// `CFStringRef` qualifier `TranslateUIDToDevice` receives back out again.
-//
-// Passing `NULL` for the allocator argument is documented by Apple as
-// equivalent to `kCFAllocatorDefault`, so no external `kCFAllocatorDefault`
-// static needs to be linked.
+// Ownership follows CoreFoundation's naming: a Get-rule result
+// (`CFBundleGetBundleWithIdentifier`) is borrowed and must never be released;
+// a Copy- or Create-rule result is owned and must be released or handed on.
+// `CFRelease(NULL)` crashes, so null-check first. A NULL allocator is the default.
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     pub fn CFStringCreateWithCString(
@@ -46,14 +35,6 @@ extern "C" {
         encoding: u32,
     ) -> CFStringRef;
 
-    /// Best-effort fast path for reading a `CFStringRef`'s bytes without a
-    /// copy; returns null if the string isn't stored in a compatible
-    /// internal representation, in which case the caller must fall back to
-    /// `CFStringGetCString`.
-
-    /// Copies up to `buffer_size` bytes (including the trailing NUL) of
-    /// `the_string` into `buffer` using `encoding`. Returns `0` (false) on
-    /// failure, nonzero on success.
     pub fn CFStringGetCString(
         the_string: CFStringRef,
         buffer: *mut c_char,
@@ -61,20 +42,8 @@ extern "C" {
         encoding: u32,
     ) -> u8;
 
-    /// Looks up an already-registered bundle by its `CFBundleIdentifier`.
-    /// This is a Get-rule API: the returned `CFBundleRef` is borrowed from
-    /// CoreFoundation's bundle registry, NOT owned by the caller — releasing
-    /// it corrupts that registry entry for every other caller. Returns NULL
-    /// if no bundle with that identifier is registered (e.g. this driver's
-    /// `.driver` bundle has not been loaded by `coreaudiod`).
     pub fn CFBundleGetBundleWithIdentifier(bundle_id: CFStringRef) -> CFBundleRef;
 
-    /// Locates a resource file (by name and extension, optionally within a
-    /// subdirectory of `Contents/Resources`) inside `bundle`. This is a
-    /// Copy-rule API: the caller owns the returned `CFURLRef` and must
-    /// either release it or transfer that ownership onward — this driver
-    /// does the latter, handing it straight to the HAL as a property value.
-    /// Returns NULL if `bundle` is NULL or the resource does not exist.
     pub fn CFBundleCopyResourceURL(
         bundle: CFBundleRef,
         resource_name: CFStringRef,
@@ -82,19 +51,11 @@ extern "C" {
         sub_dir_name: CFStringRef,
     ) -> CFURLRef;
 
-    /// Releases a Create- or Copy-rule CoreFoundation reference this driver
-    /// owns (never a Get-rule reference like the `CFBundleRef` above).
-    /// `CFRelease(NULL)` is documented by Apple to crash, so every call site
-    /// must null-check first — see `ffi::plugin`'s `icon_resource_url`.
     pub fn CFRelease(cf: *const c_void);
 }
 
-/// Mirrors `<mach/mach_time.h>`'s `mach_timebase_info_data_t`: the
-/// numerator/denominator pair that converts `mach_absolute_time()` ticks to
-/// nanoseconds (`ns = ticks * numer / denom`). On Apple Silicon this is
-/// *not* 1:1 (ticks run at the 24MHz timebase, numer/denom ~= 125/3); on
-/// Intel it typically is 1:1. Must always be queried at runtime, never
-/// assumed.
+/// `mach_timebase_info_data_t`: `ns = ticks * numer / denom`. Not 1:1 on
+/// Apple Silicon (about 125/3), so always queried at runtime, never assumed.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct MachTimebaseInfo {
@@ -102,17 +63,10 @@ pub struct MachTimebaseInfo {
     pub denom: u32,
 }
 
-// `mach_absolute_time`/`mach_timebase_info` are part of libSystem, linked
-// into every macOS binary by default — no `#[link(name = ...)]` needed,
-// unlike the CoreFoundation entry points above.
+// libSystem, linked into every macOS binary; no `#[link]` needed.
 extern "C" {
-    /// Monotonic tick counter. The only clock source this driver reads —
-    /// see `engine::clock`, which turns raw ticks into a monotonic
-    /// zero-timestamp timeline without itself touching this function.
     pub fn mach_absolute_time() -> u64;
 
-    /// Fills in the tick-to-nanosecond conversion ratio for this machine.
-    /// Returns a `kern_return_t` (`0` == `KERN_SUCCESS`).
     pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
@@ -171,13 +125,8 @@ pub struct AudioValueRange {
     pub maximum: f64,
 }
 
-/// Mirrors CoreAudio's `AudioStreamRangedDescription` — NOT the same type as
-/// `AudioStreamBasicDescription`. `kAudioStreamPropertyAvailableVirtualFormats`
-/// ('sfma') and `kAudioStreamPropertyAvailablePhysicalFormats` ('pfta') are
-/// arrays of *this* 56-byte struct (a format plus the sample-rate range it's
-/// valid over), not arrays of the 40-byte bare `AudioStreamBasicDescription`
-/// that `'sfmt'`/`'pft '` return. Confusing the two silently corrupts every
-/// element's offset for a host walking the array. See tests/abi.rs.
+/// `'sfma'`/`'pfta'` return arrays of this 56-byte struct, not of the 40-byte
+/// `AudioStreamBasicDescription` that `'sfmt'`/`'pft '` return.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct AudioStreamRangedDescription {
@@ -194,14 +143,8 @@ pub struct AudioServerPlugInClientInfo {
     pub bundle_id: CFStringRef,
 }
 
-/// Mirrors CoreAudio's `AudioServerPlugInIOCycleInfo`.
-///
-/// Apple's header names the buffer-size field `mNominalIOBufferFrameSize`
-/// (not `mIOBufferFrameSize`), declares `mInputTime` before `mOutputTime`, and
-/// has two trailing `Float64` fields — `mMainHostTicksPerFrame` (a union with
-/// the deprecated `mMasterHostTicksPerFrame` alias, so a single `f64` field
-/// reproduces the layout) and `mDeviceHostTicksPerFrame`. Every field offset
-/// is checked against the header in tests/abi.rs.
+/// The header's `mMainHostTicksPerFrame` is a union with the deprecated
+/// `mMasterHostTicksPerFrame` alias; a single `f64` reproduces the layout.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct AudioServerPlugInIOCycleInfo {

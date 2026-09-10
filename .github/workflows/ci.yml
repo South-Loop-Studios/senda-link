@@ -47,7 +47,8 @@ jobs:
   dco:
     name: DCO sign-off
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Only the public repository takes outside contributions; the internal one does not sign off.
+    if: github.event_name == 'pull_request' && github.repository == 'South-Loop-Studios/senda-link'
     steps:
       - uses: actions/checkout@v4
         with:

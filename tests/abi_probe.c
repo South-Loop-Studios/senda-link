@@ -1,28 +1,10 @@
-/* Ground truth from Apple's header. Prints sizes and offsets that tests/abi.rs
- * compares against the Rust declarations. The static initializer below is the
- * signature check: assigning a wrongly-typed function to a typed struct member
- * is a constraint violation under -Werror=incompatible-pointer-types. Every
- * member of AudioServerPlugInDriverInterface is assigned a matching prototype
- * here so that no function-pointer field can silently carry a wrong signature.
+/* Prints the SDK's sizes, offsets and four-character codes for tests/abi.rs.
+ * The static initialiser below is the signature check: a wrongly-typed
+ * function assigned to a struct member fails -Werror=incompatible-pointer-types.
  *
- * LIMITATION — read this before editing either this file or src/ffi/types.rs:
- * every vtable member is an 8-byte function pointer, so `sizeof` and
- * `offsetof` on AudioServerPlugInDriverInterface cannot distinguish two
- * members with byte-identical prototypes. Swapping, say, the initializers
- * for `.BeginIOOperation` and `.EndIOOperation` below compiles clean and
- * every assertion in tests/abi.rs still passes, because both are
- * `OSStatus (*)(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32,
- * UInt32, const AudioServerPlugInIOCycleInfo*)`. The `-Werror=incompatible-
- * pointer-types` check only proves each stub's *own* parameter/return types
- * match the corresponding Apple prototype — it says nothing about whether a
- * stub got wired to the *correct* struct field when two fields share a
- * shape. The per-field offsetof assertions below catch a member being
- * inserted, deleted, or reordered (the drift mode that actually happens
- * when the header or this struct changes), but a same-signature
- * transposition between two still-present fields is invisible to every
- * mechanical check here. Keeping the C stub list and the Rust struct in
- * the same member order, by eye, is still required.
- */
+ * LIMITATION: every vtable member is an 8-byte pointer, so transposing two
+ * same-signature members (BeginIOOperation and EndIOOperation, say) passes
+ * every check here. Keep the stub list in the header's order, by eye. */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreAudio/AudioHardware.h> /* kAudioHardwarePropertyMixStereoToMono */
 #include <CoreAudio/CoreAudioTypes.h> /* kAudioFormatLinearPCM */
@@ -30,13 +12,7 @@
 #include <stdio.h>
 #include <stddef.h>
 
-/* Signature check for the two mach_time.h entry points src/ffi/types.rs
- * hand-declares (`mach_absolute_time`, `mach_timebase_info`) and the
- * `MachTimebaseInfo` struct mirroring `mach_timebase_info_data_t` — same
- * idiom as the AudioServerPlugInDriverInterface check above: assigning a
- * wrongly-typed function to a typed pointer is a constraint violation
- * under -Werror=incompatible-pointer-types.
- */
+/* The same signature check for the two mach_time.h entry points. */
 static uint64_t (*p_mach_absolute_time)(void) = mach_absolute_time;
 static kern_return_t (*p_mach_timebase_info)(mach_timebase_info_t) = mach_timebase_info;
 
@@ -190,10 +166,7 @@ int main(void) {
     printf("clientinfo_off_bundleid=%zu\n",
            offsetof(AudioServerPlugInClientInfo, mBundleID));
 
-    /* All 22 function-pointer members, in declaration order. This catches an
-     * inserted, deleted, or reordered member. It does NOT catch two
-     * same-signature members being transposed with each other — see the
-     * LIMITATION comment at the top of this file. */
+    /* All 22 members, in declaration order. */
     printf("iface_off_queryinterface=%zu\n",
            offsetof(AudioServerPlugInDriverInterface, QueryInterface));
     printf("iface_off_addref=%zu\n",
@@ -239,32 +212,13 @@ int main(void) {
     printf("iface_off_endiooperation=%zu\n",
            offsetof(AudioServerPlugInDriverInterface, EndIOOperation));
 
-    /* The two `DoIOOperation` operation ID constants src/ffi/plugin.rs
-     * matches against. With a wrong value, senda_WillDoIOOperation never
-     * matches a real inOperationID the HAL asks about, falls to its `else`
-     * arm, answers *will = 0 for both, and senda_DoIOOperation is never
-     * called at all: the device enumerates, starts, and keeps time, but
-     * passes no audio in either direction. fourcc_matches_known_constants
-     * in tests/abi.rs asserts these against Apple's real
-     * kAudioServerPlugInIOOperationWriteMix/
-     * kAudioServerPlugInIOOperationReadInput macros below, so a typo fails
-     * `cargo test` instead of only a manual audio check. */
     printf("op_write_mix=%u\n", (unsigned)kAudioServerPlugInIOOperationWriteMix);
     printf("op_read_input=%u\n", (unsigned)kAudioServerPlugInIOOperationReadInput);
 
-    /* kAudioObjectPropertyOwner ('stdv') and its look-alike
-     * kAudioHardwarePropertyMixStereoToMono ('stmo'), a different real
-     * selector that is easy to use in Owner's place. Both are printed so
-     * tests/abi.rs can check the pair. */
+    /* 'stmo' is a plausible look-alike for Owner's 'stdv'; both are printed. */
     printf("prop_owner=%u\n", (unsigned)kAudioObjectPropertyOwner);
     printf("prop_mix_stereo_to_mono=%u\n", (unsigned)kAudioHardwarePropertyMixStereoToMono);
 
-    /* Every remaining fourcc constant used anywhere in `src/` (a class ID,
-     * a property selector, a scope, a transport type, a format ID, or an
-     * error code), matched against its real Apple macro. `tests/abi.rs`
-     * asserts each of these via one table, so a wrong constant — invented
-     * outright, or a real selector used in the wrong place — fails
-     * `cargo test` instead of only a manual audio/property check. */
     printf("class_object=%u\n", (unsigned)kAudioObjectClassID);
     printf("class_plugin=%u\n", (unsigned)kAudioPlugInClassID);
     printf("class_device=%u\n", (unsigned)kAudioDeviceClassID);
@@ -277,10 +231,7 @@ int main(void) {
     printf("prop_name=%u\n", (unsigned)kAudioObjectPropertyName);
     printf("scope_input=%u\n", (unsigned)kAudioObjectPropertyScopeInput);
     printf("scope_output=%u\n", (unsigned)kAudioObjectPropertyScopeOutput);
-    /* Not a named constant anywhere in src/ — the driver treats anything
-     * that isn't 'inpt'/'outp' as global (see `streams_for_scope`'s doc
-     * comment) rather than matching this value explicitly. Checked anyway
-     * since it's free and documents that implicit-fallback assumption. */
+    /* Not named in src/: anything that is not 'inpt'/'outp' is treated as global. */
     printf("scope_global=%u\n", (unsigned)kAudioObjectPropertyScopeGlobal);
 
     printf("dev_device_list=%u\n", (unsigned)kAudioPlugInPropertyDeviceList);
@@ -326,10 +277,6 @@ int main(void) {
 
     printf("format_linear_pcm=%u\n", (unsigned)kAudioFormatLinearPCM);
 
-    /* The error codes the driver derives with `fourcc`: `ffi::plugin`'s
-     * ERR_UNKNOWN_PROPERTY, ERR_UNSUPPORTED, ERR_BAD_OBJECT,
-     * ERR_BAD_PROPERTY_SIZE and ERR_UNSPECIFIED, plus
-     * `engine::properties`' ERR_ILLEGAL_VALUE. */
     printf("err_unknown_property=%u\n", (unsigned)kAudioHardwareUnknownPropertyError);
     printf("err_unsupported_operation=%u\n", (unsigned)kAudioHardwareUnsupportedOperationError);
     printf("err_bad_object=%u\n", (unsigned)kAudioHardwareBadObjectError);
@@ -337,19 +284,8 @@ int main(void) {
     printf("err_bad_property_size=%u\n", (unsigned)kAudioHardwareBadPropertySizeError);
     printf("err_unspecified=%u\n", (unsigned)kAudioHardwareUnspecifiedError);
 
-    /* MachTimebaseInfo's field values, not just its layout.
-     * `timebase_off_numer`/`timebase_off_denom` above only prove Rust's
-     * `numer`/`denom` fields sit at the same byte offsets as C's — an
-     * inverted ratio (dividing the wrong way, or a calling-convention
-     * mismatch that quietly swapped which field ends up holding which value
-     * at runtime) would still pass every check above while being roughly
-     * 40x wrong on Apple Silicon (numer/denom ~= 125/3 there, vs.
-     * denom/numer ~= 3/125), silently mis-scaling every
-     * mach_absolute_time() reading this driver's clock depends on. Printed
-     * here from an actual runtime call to `mach_timebase_info`, so
-     * tests/abi.rs can compare against an actual runtime call to the same
-     * function through the Rust FFI declaration — not just a struct
-     * layout comparison. */
+    /* Live values, not just layout: an inverted ratio passes every offset
+     * check above and is ~40x wrong on Apple Silicon. */
     mach_timebase_info_data_t tbi;
     kern_return_t tbi_kr = mach_timebase_info(&tbi);
     printf("timebase_live_kr=%u\n", (unsigned)tbi_kr);

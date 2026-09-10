@@ -1,46 +1,27 @@
-//! Static device table and per-device mutable state.
-//!
-//! Five devices ship in one bundle: 2/8/16/32/128 channels. Everything here
-//! is a compile-time constant table plus a fixed-size array of atomics — no
-//! `Vec`, no `Mutex`, no allocation, matching the "safe Rust only" contract
-//! in `engine::mod`.
+//! Static device table and per-device mutable state: five devices
+//! (2/8/16/32/128 channels), a compile-time table plus fixed-size arrays of
+//! atomics. No `Vec`, no `Mutex`, no allocation.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// Object ID of the plugin (`kAudioObjectPlugInObject`), the root object
-/// every device is owned by. Fixed by the HAL's object model, not chosen by
-/// us.
+/// `kAudioObjectPlugInObject`, the root object every device is owned by.
 pub const PLUGIN_OBJECT_ID: u32 = 1;
 
 pub const SAMPLE_RATES: [f64; 6] = [44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0];
 pub const DEFAULT_SAMPLE_RATE: f64 = 48000.0;
 
-/// IO block size in frames. Not the same thing as `ZeroTimeStampPeriod` —
-/// see `RING_FRAMES` below and `engine::properties::zero_timestamp_period`.
-///
-/// Non-negotiable: a settable buffer size (see `PerDevice::buffer_frames`,
-/// which backs the `'fsiz'` / `BufferFrameSize` property) must never be
-/// implemented by making this constant variable. `RING_FRAMES = BLOCK *
-/// RING_BLOCKS`, so a variable `BLOCK` would make `ZeroTimeStampPeriod` a
-/// function of the client's requested buffer size — reintroducing the exact
-/// defect this project exists to fix. The negotiated buffer size lives in
-/// `PerDevice` and touches nothing in this ring geometry.
+/// IO block size in frames. Never make this variable: `RING_FRAMES = BLOCK *
+/// RING_BLOCKS` is the `ZeroTimeStampPeriod`, and deriving that from a client's
+/// buffer size is the defect this project exists to fix.
 pub const BLOCK: usize = 512;
 pub const RING_BLOCKS: usize = 64;
 
-/// Range of buffer sizes (in frames) this driver accepts via `SetPropertyData`
-/// on `'fsiz'`. Purely a per-`PerDevice` negotiated value reported back to
-/// the host — see the non-negotiable note above.
+/// Buffer sizes accepted via `'fsiz'`; a per-`PerDevice` value, never ring geometry.
 pub const MIN_BUFFER_FRAMES: u32 = 64;
 pub const MAX_BUFFER_FRAMES: u32 = 4096;
 
-/// The clock-advance / zero-timestamp period, in frames. This is a fixed
-/// geometric constant of the ring buffer, computed once at compile time from
-/// `BLOCK * RING_BLOCKS`. It is intentionally NOT a function of any runtime
-/// buffer-size negotiation: `ZeroTimeStampPeriod` must return this exact
-/// value, always, or the HAL's scheduling model desyncs from the driver the
-/// moment a client changes its IO buffer size. See
-/// `engine::properties::zero_timestamp_period`.
+/// Clock-advance / `ZeroTimeStampPeriod` in frames. A fixed geometric constant:
+/// the HAL's scheduling desyncs if it moves with a client's buffer size.
 pub const RING_FRAMES: usize = BLOCK * RING_BLOCKS;
 
 #[derive(Clone, Copy)]
@@ -101,8 +82,7 @@ pub fn find_by_object_id(id: u32) -> Option<usize> {
     DEVICES.iter().position(|d| d.device_id == id)
 }
 
-/// Looks up a stream's owning device index and direction (`true` = input)
-/// by its `AudioObjectID`.
+/// A stream's owning device index and direction (`true` = input).
 pub fn find_by_stream_id(id: u32) -> Option<(usize, bool)> {
     DEVICES.iter().enumerate().find_map(|(i, d)| {
         if d.out_stream_id == id {
@@ -119,20 +99,9 @@ pub struct PerDevice {
     pub sample_rate: AtomicU64, // f64 bits; 0 means "use DEFAULT_SAMPLE_RATE"
     pub io_running: AtomicBool,
     pub client_count: AtomicU32,
-    /// Negotiated IO buffer size in frames, clamped to
-    /// `[MIN_BUFFER_FRAMES, MAX_BUFFER_FRAMES]`. Defaults to `BLOCK`.
-    /// Reported by `'fsiz'` and settable via `SetPropertyData` — it never
-    /// feeds back into `RING_FRAMES`/`ZeroTimeStampPeriod`. See the
-    /// non-negotiable note on `BLOCK` above.
+    /// Negotiated IO buffer size, clamped to `[MIN, MAX]_BUFFER_FRAMES`; never feeds `RING_FRAMES`.
     pub buffer_frames: AtomicU32,
-    /// Counts every `DoIOOperation` cycle in which the HAL-supplied frame
-    /// count exceeded `MAX_BUFFER_FRAMES` and was clamped down before
-    /// touching any audio (see `ffi::plugin::senda_DoIOOperation`). The
-    /// clamp is against that hard ceiling, not this device's negotiated
-    /// `buffer_frames`, so it only fires for a genuine anomaly. Clamping
-    /// itself is correct; this turns an otherwise-silent truncation into a
-    /// number a diagnostic can see, the same motivation as `Ring`'s own
-    /// `torn`/`stale`/`retries` counters.
+    /// `DoIOOperation` cycles whose frame count exceeded `MAX_BUFFER_FRAMES` and was clamped.
     frame_clamps: AtomicU64,
 }
 
@@ -164,20 +133,13 @@ impl PerDevice {
         self.buffer_frames.load(Ordering::Acquire)
     }
 
-    /// Clamps to `[MIN_BUFFER_FRAMES, MAX_BUFFER_FRAMES]` and stores.
-    /// Never rejects a request outright — an out-of-range value is clamped
-    /// to the nearest bound rather than erroring, matching how the
-    /// advertised `'fsz#'` range is meant to be read (a hard limit, not a
-    /// discrete list like `SAMPLE_RATES`).
+    /// Clamps rather than rejects: `'fsz#'` is a hard limit, not a discrete list.
     pub fn set_buffer_frames(&self, frames: u32) {
         let clamped = frames.clamp(MIN_BUFFER_FRAMES, MAX_BUFFER_FRAMES);
         self.buffer_frames.store(clamped, Ordering::Release);
     }
 
-    /// Records one `DoIOOperation` cycle whose HAL-supplied frame count
-    /// exceeded `MAX_BUFFER_FRAMES` and had to be clamped. `Relaxed` — this
-    /// is a diagnostic counter, not a synchronisation point (same
-    /// reasoning as `Ring`'s `torn`/`stale`/`retries`).
+    /// `Relaxed`: a diagnostic counter, not a synchronisation point.
     pub fn record_frame_clamp(&self) {
         self.frame_clamps.fetch_add(1, Ordering::Relaxed);
     }
@@ -260,10 +222,6 @@ mod tests {
 
     #[test]
     fn setting_buffer_frames_never_touches_ring_frames() {
-        // The non-negotiable invariant, exercised end to end: mutating a
-        // PerDevice's buffer size must not be able to move RING_FRAMES
-        // (a `const`, so this is really just documentation-as-a-test —
-        // there is structurally no path from one to the other).
         let st = PerDevice::new();
         st.set_buffer_frames(4096);
         assert_eq!(RING_FRAMES, 32768);
