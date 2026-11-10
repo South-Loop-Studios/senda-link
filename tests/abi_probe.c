@@ -8,6 +8,7 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreAudio/AudioHardware.h> /* kAudioHardwarePropertyMixStereoToMono */
 #include <CoreAudio/CoreAudioTypes.h> /* kAudioFormatLinearPCM */
+#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -123,8 +124,43 @@ static AudioServerPlugInDriverInterface probe = {
     .EndIOOperation   = p_EndIOOperation,
 };
 
+/* The host interface, checked the same way: the driver calls through it. */
+static OSStatus h_PropertiesChanged(AudioServerPlugInHostRef h, AudioObjectID o, UInt32 n,
+                                    const AudioObjectPropertyAddress a[]) {
+    (void)h; (void)o; (void)n; (void)a; return 0;
+}
+static OSStatus h_CopyFromStorage(AudioServerPlugInHostRef h, CFStringRef k, CFPropertyListRef* d) {
+    (void)h; (void)k; (void)d; return 0;
+}
+static OSStatus h_WriteToStorage(AudioServerPlugInHostRef h, CFStringRef k, CFPropertyListRef d) {
+    (void)h; (void)k; (void)d; return 0;
+}
+static OSStatus h_DeleteFromStorage(AudioServerPlugInHostRef h, CFStringRef k) {
+    (void)h; (void)k; return 0;
+}
+static OSStatus h_RequestDeviceConfigurationChange(AudioServerPlugInHostRef h, AudioObjectID o,
+                                                   UInt64 a, void* i) {
+    (void)h; (void)o; (void)a; (void)i; return 0;
+}
+
+static AudioServerPlugInHostInterface host_probe = {
+    .PropertiesChanged = h_PropertiesChanged,
+    .CopyFromStorage   = h_CopyFromStorage,
+    .WriteToStorage    = h_WriteToStorage,
+    .DeleteFromStorage = h_DeleteFromStorage,
+    .RequestDeviceConfigurationChange = h_RequestDeviceConfigurationChange,
+};
+
+/* And the two libdispatch entry points the request is sent through. */
+static dispatch_queue_global_t (*p_dispatch_get_global_queue)(intptr_t, uintptr_t) =
+    dispatch_get_global_queue;
+static void (*p_dispatch_async_f)(dispatch_queue_t, void*, dispatch_function_t) = dispatch_async_f;
+
 int main(void) {
     (void)probe;
+    (void)host_probe;
+    (void)p_dispatch_get_global_queue;
+    (void)p_dispatch_async_f;
     (void)p_mach_absolute_time;
     (void)p_mach_timebase_info;
     printf("iface_size=%zu\n", sizeof(AudioServerPlugInDriverInterface));
@@ -211,6 +247,19 @@ int main(void) {
            offsetof(AudioServerPlugInDriverInterface, DoIOOperation));
     printf("iface_off_endiooperation=%zu\n",
            offsetof(AudioServerPlugInDriverInterface, EndIOOperation));
+
+    printf("host_size=%zu\n", sizeof(AudioServerPlugInHostInterface));
+    printf("host_off_propertieschanged=%zu\n",
+           offsetof(AudioServerPlugInHostInterface, PropertiesChanged));
+    printf("host_off_copyfromstorage=%zu\n",
+           offsetof(AudioServerPlugInHostInterface, CopyFromStorage));
+    printf("host_off_writetostorage=%zu\n",
+           offsetof(AudioServerPlugInHostInterface, WriteToStorage));
+    printf("host_off_deletefromstorage=%zu\n",
+           offsetof(AudioServerPlugInHostInterface, DeleteFromStorage));
+    printf("host_off_requestdeviceconfigurationchange=%zu\n",
+           offsetof(AudioServerPlugInHostInterface, RequestDeviceConfigurationChange));
+    printf("err_unsupported_format=%u\n", (unsigned)kAudioDeviceUnsupportedFormatError);
 
     printf("op_write_mix=%u\n", (unsigned)kAudioServerPlugInIOOperationWriteMix);
     printf("op_read_input=%u\n", (unsigned)kAudioServerPlugInIOOperationReadInput);

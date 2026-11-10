@@ -261,6 +261,35 @@ fn abi_layout_matches_sdk() {
         std::mem::offset_of!(AudioServerPlugInDriverInterface, EndIOOperation),
         g("iface_off_endiooperation")
     );
+
+    // The host interface: all five members, in declaration order.
+    assert_eq!(
+        std::mem::size_of::<AudioServerPlugInHostInterface>(),
+        g("host_size")
+    );
+    assert_eq!(
+        std::mem::offset_of!(AudioServerPlugInHostInterface, PropertiesChanged),
+        g("host_off_propertieschanged")
+    );
+    assert_eq!(
+        std::mem::offset_of!(AudioServerPlugInHostInterface, CopyFromStorage),
+        g("host_off_copyfromstorage")
+    );
+    assert_eq!(
+        std::mem::offset_of!(AudioServerPlugInHostInterface, WriteToStorage),
+        g("host_off_writetostorage")
+    );
+    assert_eq!(
+        std::mem::offset_of!(AudioServerPlugInHostInterface, DeleteFromStorage),
+        g("host_off_deletefromstorage")
+    );
+    assert_eq!(
+        std::mem::offset_of!(
+            AudioServerPlugInHostInterface,
+            RequestDeviceConfigurationChange
+        ),
+        g("host_off_requestdeviceconfigurationchange")
+    );
 }
 
 #[test]
@@ -470,6 +499,11 @@ fn fourcc_matches_every_remaining_production_constant() {
             "kAudioHardwareBadPropertySizeError",
         ),
         (b"what", "err_unspecified", "kAudioHardwareUnspecifiedError"),
+        (
+            b"!dat",
+            "err_unsupported_format",
+            "kAudioDeviceUnsupportedFormatError",
+        ),
     ];
 
     for (bytes, key, sdk_name) in checks {

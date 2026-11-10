@@ -5,15 +5,17 @@
 //! `StartIO`/`StopIO` ref-count clients per device; the first client's
 //! `StartIO` anchors the clock and wipes the ring. `DoIOOperation` hands an
 //! `f32` slice to `engine::io`, indexed by the HAL's sample time for the cycle.
+//! A sample-rate change is requested of the HAL from `SetPropertyData` and
+//! applied in `PerformDeviceConfigurationChange`, never directly.
 //! Nothing on the IO path allocates, locks or can panic.
 
 use super::types::*;
 use crate::engine::clock::CLOCKS;
 use crate::engine::device;
 use crate::engine::io;
-use crate::engine::properties::{self, Value};
+use crate::engine::properties::{self, SetOutcome, Value};
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub const OK: OSStatus = 0;
 /// `kAudioHardwareUnknownPropertyError`: the selector isn't one this object kind answers.
@@ -69,8 +71,65 @@ unsafe extern "C" fn senda_Release(_s: *mut c_void) -> u32 {
 /// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_Initialize(
     _d: AudioServerPlugInDriverRef,
-    _host: *const c_void,
+    host: AudioServerPlugInHostRef,
 ) -> OSStatus {
+    HOST.store(host.cast_mut(), Ordering::Release);
+    OK
+}
+
+/// The HAL's interface, from `Initialize`; valid for the life of the process.
+/// Null until then, which only a unit test ever observes.
+static HOST: AtomicPtr<AudioServerPlugInHostInterface> = AtomicPtr::new(std::ptr::null_mut());
+
+/// A requested rate change as the one pointer-sized word `dispatch_async_f`
+/// carries: device `AudioObjectID` in the high half, rate in Hz in the low.
+/// Every offered rate is a whole number of Hz well inside `u32`.
+fn pack_rate_request(device_id: AudioObjectID, rate: f64) -> usize {
+    ((device_id as usize) << 32) | (rate as u32 as usize)
+}
+
+fn unpack_rate_request(word: usize) -> (AudioObjectID, u64) {
+    ((word >> 32) as AudioObjectID, (word & 0xFFFF_FFFF) as u64)
+}
+
+/// `dispatch_async_f` work function: `context` is a `pack_rate_request` word, not a pointer.
+unsafe extern "C" fn request_rate_change_on_queue(context: *mut c_void) {
+    let (device_id, action) = unpack_rate_request(context as usize);
+    let host = HOST.load(Ordering::Acquire);
+    if host.is_null() {
+        return;
+    }
+    // SAFETY: `host` is the non-null interface the HAL passed to `Initialize`,
+    // which it keeps valid for the life of the process. A refusal has no one
+    // to be reported to: the rate simply stays what it was.
+    unsafe {
+        ((*host).RequestDeviceConfigurationChange)(host, device_id, action, std::ptr::null_mut());
+    }
+}
+
+/// Asks the HAL to change `dev`'s rate. The HAL caches the rate and both
+/// stream formats and runs IO at them, so the driver may not change them
+/// under it: it answers with `PerformDeviceConfigurationChange`, where the
+/// change is made. The request is sent from a dispatch queue, as Apple's
+/// sample drivers do, because the HAL may take locks it already holds across
+/// the `SetPropertyData` call this is reached from.
+fn request_rate_change(dev: usize, rate: f64) -> OSStatus {
+    let Some(cfg) = device::DEVICES.get(dev) else {
+        return ERR_BAD_OBJECT;
+    };
+    if HOST.load(Ordering::Acquire).is_null() {
+        return ERR_UNSPECIFIED;
+    }
+    let context = pack_rate_request(cfg.device_id, rate) as *mut c_void;
+    // SAFETY: the global queue outlives the process's use of it; the work
+    // function never dereferences `context`.
+    unsafe {
+        dispatch_async_f(
+            dispatch_get_global_queue(0, 0),
+            context,
+            request_rate_change_on_queue,
+        );
+    }
     OK
 }
 
@@ -114,10 +173,33 @@ unsafe extern "C" fn senda_RemoveDeviceClient(
 /// Called by the HAL through the vtable; every pointer is valid per the AudioServerPlugIn contract.
 unsafe extern "C" fn senda_PerformDeviceConfigurationChange(
     _d: AudioServerPlugInDriverRef,
-    _id: AudioObjectID,
-    _a: u64,
+    id: AudioObjectID,
+    action: u64,
     _i: *mut c_void,
 ) -> OSStatus {
+    // The only change this driver requests is a rate, and `action` is that
+    // rate in Hz (see `pack_rate_request`). The HAL has stopped IO on the
+    // device for this call and re-reads the device's state when it returns.
+    let Some(dev) = device::find_by_object_id(id) else {
+        return ERR_BAD_OBJECT;
+    };
+    if let Err(status) = properties::apply_rate(dev, action as f64) {
+        return status;
+    }
+    if let (Some(clock), Some(state)) = (CLOCKS.get(dev), device::STATE.get(dev)) {
+        // The new rate voids the zero-timestamp timeline and every stamp in
+        // the ring. The ring is skipped if IO is still marked running:
+        // `Ring::zero` would be a second writer, and the next 0->1 `StartIO`
+        // zeroes anyway.
+        if !state.io_running.load(Ordering::Acquire) {
+            if let Some(ring) = io::rings_for(dev) {
+                ring.zero();
+            }
+        }
+        // SAFETY: reads the monotonic tick counter; touches no memory.
+        let now = unsafe { mach_absolute_time() };
+        clock.start(now, state.rate(), host_ns_per_tick());
+    }
     OK
 }
 /// # Safety
@@ -441,31 +523,13 @@ unsafe extern "C" fn senda_SetPropertyData(
     }
     // SAFETY: `data` is non-null and, per the HAL contract, `data_size` is the
     // size of the allocation behind it, so `len <= data_size` bytes lie within
-    // it. The 8-byte cap bounds the copy; it is no defence against a wrong `data_size`.
-    let len = (data_size as usize).min(8);
+    // it. The cap is the largest settable value, a stream format; it bounds
+    // the copy and is no defence against a wrong `data_size`.
+    let len = (data_size as usize).min(std::mem::size_of::<AudioStreamBasicDescription>());
     let slice: &[u8] = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
-    let result = properties::set_property_data(id, &addr, slice);
-    // A successful NominalSampleRate change voids the zero-timestamp
-    // timeline; the validated rate is read back from `STATE`.
-    if result.is_ok() && addr.selector == fourcc(b"nsrt") {
-        if let Some(dev) = device::find_by_object_id(id) {
-            if let (Some(clock), Some(state)) = (CLOCKS.get(dev), device::STATE.get(dev)) {
-                // Skipped while IO runs: `Ring::zero` would be a second writer,
-                // and the next 0->1 `StartIO` zeroes anyway. Not atomic with
-                // respect to `StartIO`; `START_STOP_LOCKS` is not held here.
-                if !state.io_running.load(Ordering::Acquire) {
-                    if let Some(ring) = io::rings_for(dev) {
-                        ring.zero();
-                    }
-                }
-                // SAFETY: reads the monotonic tick counter; touches no memory.
-                let now = unsafe { mach_absolute_time() };
-                clock.start(now, state.rate(), host_ns_per_tick());
-            }
-        }
-    }
-    match result {
-        Ok(()) => OK,
+    match properties::set_property_data(id, &addr, slice) {
+        Ok(SetOutcome::Done) => OK,
+        Ok(SetOutcome::RateChange { dev, rate }) => request_rate_change(dev, rate),
         Err(status) => status,
     }
 }
@@ -532,6 +596,9 @@ unsafe extern "C" fn senda_StopIO(
                 let _guard = lock
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // `fetch_update` is deprecated in favour of `try_update`, which
+                // is newer than this crate's `rust-version`.
+                #[allow(deprecated)]
                 let prev =
                     state
                         .client_count
@@ -981,9 +1048,129 @@ mod tests {
         );
     }
 
-    // Uses device id 40 (index 3), exclusive to this test.
+    /// What the fake HAL below was last asked for.
+    static REQUESTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static REQUESTED_DEVICE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static REQUESTED_ACTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    unsafe extern "C" fn fake_properties_changed(
+        _h: AudioServerPlugInHostRef,
+        _id: AudioObjectID,
+        _n: u32,
+        _a: *const AudioObjectPropertyAddress,
+    ) -> OSStatus {
+        OK
+    }
+    unsafe extern "C" fn fake_copy_from_storage(
+        _h: AudioServerPlugInHostRef,
+        _k: CFStringRef,
+        _o: *mut *const c_void,
+    ) -> OSStatus {
+        OK
+    }
+    unsafe extern "C" fn fake_write_to_storage(
+        _h: AudioServerPlugInHostRef,
+        _k: CFStringRef,
+        _d: *const c_void,
+    ) -> OSStatus {
+        OK
+    }
+    unsafe extern "C" fn fake_delete_from_storage(
+        _h: AudioServerPlugInHostRef,
+        _k: CFStringRef,
+    ) -> OSStatus {
+        OK
+    }
+    /// Records the request and, unlike the HAL, performs nothing: the test calls `Perform` itself.
+    unsafe extern "C" fn fake_request_config_change(
+        _h: AudioServerPlugInHostRef,
+        id: AudioObjectID,
+        action: u64,
+        _i: *mut c_void,
+    ) -> OSStatus {
+        REQUESTED_DEVICE.store(id, Ordering::Release);
+        REQUESTED_ACTION.store(action, Ordering::Release);
+        REQUESTS.fetch_add(1, Ordering::Release);
+        OK
+    }
+    static FAKE_HOST: AudioServerPlugInHostInterface = AudioServerPlugInHostInterface {
+        PropertiesChanged: fake_properties_changed,
+        CopyFromStorage: fake_copy_from_storage,
+        WriteToStorage: fake_write_to_storage,
+        DeleteFromStorage: fake_delete_from_storage,
+        RequestDeviceConfigurationChange: fake_request_config_change,
+    };
+
+    /// Blocks until the fake HAL has seen request number `n`; the request crosses a dispatch queue.
+    fn wait_for_request(n: u32) -> (AudioObjectID, u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while REQUESTS.load(Ordering::Acquire) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the HAL was never asked for configuration change {n}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        (
+            REQUESTED_DEVICE.load(Ordering::Acquire),
+            REQUESTED_ACTION.load(Ordering::Acquire),
+        )
+    }
+
+    fn rate_of(dev: usize) -> f64 {
+        device::STATE.get(dev).map_or(0.0, device::PerDevice::rate)
+    }
+
     #[test]
-    fn set_property_data_sample_rate_change_resets_the_clock_and_bumps_the_seed() {
+    fn a_rate_request_survives_the_one_word_it_is_carried_in() {
+        for cfg in &device::DEVICES {
+            for rate in device::SAMPLE_RATES {
+                assert_eq!(
+                    unpack_rate_request(pack_rate_request(cfg.device_id, rate)),
+                    (cfg.device_id, rate as u64)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perform_device_configuration_change_rejects_what_was_never_requested() {
+        assert_eq!(
+            unsafe {
+                senda_PerformDeviceConfigurationChange(
+                    std::ptr::null_mut(),
+                    9999,
+                    96000,
+                    std::ptr::null_mut(),
+                )
+            },
+            ERR_BAD_OBJECT
+        );
+        // Device id 20 (index 1): a rejected rate changes nothing, so no other test can see this.
+        let before = rate_of(1);
+        assert_eq!(
+            unsafe {
+                senda_PerformDeviceConfigurationChange(
+                    std::ptr::null_mut(),
+                    20,
+                    12345,
+                    std::ptr::null_mut(),
+                )
+            },
+            properties::ERR_ILLEGAL_VALUE
+        );
+        assert_eq!(rate_of(1), before);
+    }
+
+    // Uses device id 40 (index 3, streams 41/42), exclusive to this test. It
+    // is also the only test that sets a valid rate through the vtable, so the
+    // only one that needs (and installs) a host.
+    #[test]
+    fn a_rate_change_is_requested_of_the_hal_and_applied_only_when_it_performs_it() {
+        assert_eq!(
+            unsafe { senda_Initialize(std::ptr::null_mut(), &FAKE_HOST) },
+            OK
+        );
         assert_eq!(unsafe { senda_StartIO(std::ptr::null_mut(), 40, 0) }, OK);
 
         let mut st1 = -1.0_f64;
@@ -1016,6 +1203,47 @@ mod tests {
             )
         };
         assert_eq!(status, OK);
+        assert_eq!(wait_for_request(1), (40, 96000));
+
+        // Requested, not performed: the HAL still runs IO at the old rate.
+        let mut st_pending = -1.0_f64;
+        let mut ht_pending = 0_u64;
+        let mut seed_pending = 0_u64;
+        assert_eq!(
+            unsafe {
+                senda_GetZeroTimeStamp(
+                    std::ptr::null_mut(),
+                    40,
+                    0,
+                    &mut st_pending,
+                    &mut ht_pending,
+                    &mut seed_pending,
+                )
+            },
+            OK
+        );
+        assert_eq!(
+            rate_of(3),
+            48000.0,
+            "the rate must not change until the HAL performs the change"
+        );
+        assert_eq!(
+            seed_pending, seed1,
+            "the clock must not restart until the HAL performs the change"
+        );
+
+        assert_eq!(
+            unsafe {
+                senda_PerformDeviceConfigurationChange(
+                    std::ptr::null_mut(),
+                    40,
+                    96000,
+                    std::ptr::null_mut(),
+                )
+            },
+            OK
+        );
+        assert_eq!(rate_of(3), 96000.0);
 
         let mut st2 = -1.0_f64;
         let mut ht2 = 0_u64;
@@ -1035,6 +1263,47 @@ mod tests {
             seed1, seed2,
             "seed must change so the HAL discards its cached timeline"
         );
+
+        // A stream's format is the other way a host sets the rate; it is
+        // asked of the HAL as a change to the owning device.
+        let format_addr = AudioObjectPropertyAddress {
+            selector: fourcc(b"pft "),
+            scope: 0,
+            element: 0,
+        };
+        let Ok(Value::Asbd(mut format)) = properties::stream_property(3, false, &format_addr)
+        else {
+            panic!("the output stream must report a physical format");
+        };
+        assert_eq!(format.sample_rate, 96000.0);
+        format.sample_rate = 44100.0;
+        let status = unsafe {
+            senda_SetPropertyData(
+                std::ptr::null_mut(),
+                41,
+                0,
+                &format_addr,
+                0,
+                std::ptr::null(),
+                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+                (&format as *const AudioStreamBasicDescription).cast::<c_void>(),
+            )
+        };
+        assert_eq!(status, OK);
+        assert_eq!(wait_for_request(2), (40, 44100));
+        assert_eq!(rate_of(3), 96000.0);
+        assert_eq!(
+            unsafe {
+                senda_PerformDeviceConfigurationChange(
+                    std::ptr::null_mut(),
+                    40,
+                    44100,
+                    std::ptr::null_mut(),
+                )
+            },
+            OK
+        );
+        assert_eq!(rate_of(3), 44100.0);
 
         let running = AudioObjectPropertyAddress {
             selector: fourcc(b"goin"),
