@@ -68,6 +68,16 @@ extern "C" {
     pub fn mach_absolute_time() -> u64;
 
     pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+
+    /// `dispatch_get_global_queue(intptr_t, uintptr_t)`; `(0, 0)` is the default-priority queue.
+    pub fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+
+    /// Runs `work(context)` on `queue`, later, on another thread.
+    pub fn dispatch_async_f(
+        queue: *mut c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
 }
 
 #[repr(C)]
@@ -157,6 +167,30 @@ pub struct AudioServerPlugInIOCycleInfo {
     pub device_host_ticks_per_frame: f64,
 }
 
+/// The HAL's half of the contract, handed to `Initialize`. A plain table of
+/// function pointers: unlike the driver interface it has no COM header.
+pub type AudioServerPlugInHostRef = *const AudioServerPlugInHostInterface;
+
+#[repr(C)]
+pub struct AudioServerPlugInHostInterface {
+    pub PropertiesChanged: unsafe extern "C" fn(
+        AudioServerPlugInHostRef,
+        AudioObjectID,
+        u32,
+        *const AudioObjectPropertyAddress,
+    ) -> OSStatus,
+    pub CopyFromStorage:
+        unsafe extern "C" fn(AudioServerPlugInHostRef, CFStringRef, *mut *const c_void) -> OSStatus,
+    pub WriteToStorage:
+        unsafe extern "C" fn(AudioServerPlugInHostRef, CFStringRef, *const c_void) -> OSStatus,
+    pub DeleteFromStorage: unsafe extern "C" fn(AudioServerPlugInHostRef, CFStringRef) -> OSStatus,
+    /// Asks the HAL to stop IO on the device, call the driver's
+    /// `PerformDeviceConfigurationChange` with the same `action`, restart IO
+    /// and tell every client what changed.
+    pub RequestDeviceConfigurationChange:
+        unsafe extern "C" fn(AudioServerPlugInHostRef, AudioObjectID, u64, *mut c_void) -> OSStatus,
+}
+
 pub type AudioServerPlugInDriverRef = *mut *mut AudioServerPlugInDriverInterface;
 
 #[repr(C)]
@@ -165,7 +199,8 @@ pub struct AudioServerPlugInDriverInterface {
     pub QueryInterface: unsafe extern "C" fn(*mut c_void, [u8; 16], *mut *mut c_void) -> i32,
     pub AddRef: unsafe extern "C" fn(*mut c_void) -> u32,
     pub Release: unsafe extern "C" fn(*mut c_void) -> u32,
-    pub Initialize: unsafe extern "C" fn(AudioServerPlugInDriverRef, *const c_void) -> OSStatus,
+    pub Initialize:
+        unsafe extern "C" fn(AudioServerPlugInDriverRef, AudioServerPlugInHostRef) -> OSStatus,
     pub CreateDevice: unsafe extern "C" fn(
         AudioServerPlugInDriverRef,
         CFDictionaryRef,

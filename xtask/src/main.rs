@@ -1,5 +1,5 @@
 //! `cargo xtask bundle`: builds `target/SendaLink.driver` from the release
-//! dylib, `Info.plist` and the device icon.
+//! dylib, `Info.plist`, the device icon and a copy of the licence.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,6 +52,9 @@ fn main() {
         resources.join("DeviceIcon.icns"),
     )
     .expect("copy icon");
+    // Apache 2.0 section 4(a): whoever distributes the Work gives the recipient a copy of the
+    // licence. The installer shows the terms; this is the copy that stays on disk.
+    std::fs::copy(root.join("LICENSE"), resources.join("LICENSE")).expect("copy licence");
 
     println!("bundled: {} ({version})", bundle.display());
 }

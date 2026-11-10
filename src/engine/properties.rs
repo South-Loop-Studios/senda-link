@@ -26,6 +26,9 @@ pub const ERR_ILLEGAL_VALUE: OSStatus = fourcc(b"nope") as OSStatus;
 /// not settable. Defined here so the engine depends only on `ffi::types`.
 pub const ERR_UNSUPPORTED_OPERATION: OSStatus = fourcc(b"unop") as OSStatus;
 
+/// `kAudioDeviceUnsupportedFormatError` ('!dat'): a stream format this device does not offer.
+pub const ERR_UNSUPPORTED_FORMAT: OSStatus = fourcc(b"!dat") as OSStatus;
+
 /// `kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked`.
 const LPCM_FLOAT_PACKED: u32 = (1 << 0) | (1 << 3);
 
@@ -281,9 +284,12 @@ pub fn is_property_settable(
 ) -> Result<bool, OSStatus> {
     // A selector `HasProperty` would refuse must error here too.
     resolve(id, a, None)?;
-    let is_device = matches!(classify(id), ObjectKind::Device(_));
-    let settable_selector = a.selector == fourcc(b"nsrt") || a.selector == fourcc(b"fsiz");
-    Ok(is_device && settable_selector)
+    Ok(match classify(id) {
+        ObjectKind::Device(_) => a.selector == fourcc(b"nsrt") || a.selector == fourcc(b"fsiz"),
+        // A stream's current format carries the device's rate, so it is a second way to set it.
+        ObjectKind::Stream(..) => a.selector == fourcc(b"sfmt") || a.selector == fourcc(b"pft "),
+        ObjectKind::Plugin | ObjectKind::Unknown => false,
+    })
 }
 
 pub fn get_property_data_size(
@@ -302,15 +308,79 @@ pub fn get_property_data(
     resolve(id, a, qualifier)
 }
 
-/// Applies `SetPropertyData`. `data` is already a bounds-checked slice. Only
-/// a device's `NominalSampleRate` and `BufferFrameSize` are settable.
+/// What a validated `SetPropertyData` asks of the caller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SetOutcome {
+    /// Already applied; nothing further to do.
+    Done,
+    /// A valid rate that differs from the device's current one. Nothing has
+    /// changed yet: the HAL caches the rate and both stream formats, so the
+    /// caller must ask it for a configuration change and call [`apply_rate`]
+    /// only when the HAL performs it.
+    RateChange { dev: usize, rate: f64 },
+}
+
+fn rate_outcome(dev: usize, current: f64, rate: f64) -> SetOutcome {
+    if rate == current {
+        SetOutcome::Done
+    } else {
+        SetOutcome::RateChange { dev, rate }
+    }
+}
+
+fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(bytes))
+}
+
+/// The sample rate of an `AudioStreamBasicDescription` in `data`, if every
+/// other field is the one format a `channels`-wide stream offers.
+fn rate_of_offered_asbd(data: &[u8], channels: u32) -> Result<f64, OSStatus> {
+    let rate_bytes: [u8; 8] = data
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(ERR_ILLEGAL_VALUE)?;
+    let rate = f64::from_ne_bytes(rate_bytes);
+    // Field offsets are those of `AudioStreamBasicDescription`, checked by `tests/abi.rs`.
+    let field = |offset| u32_at(data, offset).ok_or(ERR_ILLEGAL_VALUE);
+    let want = build_asbd(channels, rate);
+    let same = field(8)? == want.format_id
+        && field(12)? == want.format_flags
+        && field(16)? == want.bytes_per_packet
+        && field(20)? == want.frames_per_packet
+        && field(24)? == want.bytes_per_frame
+        && field(28)? == want.channels_per_frame
+        && field(32)? == want.bits_per_channel;
+    if !same || !SAMPLE_RATES.contains(&rate) {
+        return Err(ERR_UNSUPPORTED_FORMAT);
+    }
+    Ok(rate)
+}
+
+/// Validates `SetPropertyData`. `data` is already a bounds-checked slice.
+/// Settable: a device's `NominalSampleRate` and `BufferFrameSize`, and a
+/// stream's virtual/physical format (the rate is its only free field). A
+/// buffer size is applied here; a rate is only validated, see [`SetOutcome`].
 pub fn set_property_data(
     id: AudioObjectID,
     a: &AudioObjectPropertyAddress,
     data: &[u8],
-) -> Result<(), OSStatus> {
-    let ObjectKind::Device(dev) = classify(id) else {
-        return Err(ERR_BAD_OBJECT);
+) -> Result<SetOutcome, OSStatus> {
+    let dev = match classify(id) {
+        ObjectKind::Device(dev) => dev,
+        ObjectKind::Stream(dev, is_input) => {
+            // Keeps "unknown property" and "known but read-only" distinct.
+            stream_property(dev, is_input, a)?;
+            if a.selector != fourcc(b"sfmt") && a.selector != fourcc(b"pft ") {
+                return Err(ERR_UNSUPPORTED_OPERATION);
+            }
+            let (Some(cfg), Some(st)) = (DEVICES.get(dev), STATE.get(dev)) else {
+                return Err(ERR_BAD_OBJECT);
+            };
+            let rate = rate_of_offered_asbd(data, cfg.channels)?;
+            return Ok(rate_outcome(dev, st.rate(), rate));
+        }
+        ObjectKind::Plugin | ObjectKind::Unknown => return Err(ERR_BAD_OBJECT),
     };
     // Keeps "unknown property" and "known but read-only" distinct.
     device_property(dev, a)?;
@@ -326,11 +396,7 @@ pub fn set_property_data(
         if !SAMPLE_RATES.contains(&rate) {
             return Err(ERR_ILLEGAL_VALUE);
         }
-        st.set_rate(rate);
-        // TODO: the HAL caches NominalSampleRate/VirtualFormat, so this should go
-        // through `RequestDeviceConfigurationChange` and fire `PropertiesChanged`;
-        // no `AudioServerPlugInHostRef` reaches the engine yet, so it is applied directly.
-        return Ok(());
+        return Ok(rate_outcome(dev, st.rate(), rate));
     }
     if a.selector == fourcc(b"fsiz") {
         let bytes: [u8; 4] = data
@@ -339,9 +405,23 @@ pub fn set_property_data(
             .ok_or(ERR_ILLEGAL_VALUE)?;
         let frames = u32::from_ne_bytes(bytes);
         st.set_buffer_frames(frames); // clamps internally; never rejects
-        return Ok(());
+        return Ok(SetOutcome::Done);
     }
     Err(ERR_UNSUPPORTED_OPERATION)
+}
+
+/// Makes `rate` the device's rate: `NominalSampleRate` and both streams'
+/// formats read it from here. Called when the HAL performs the configuration
+/// change a [`SetOutcome::RateChange`] asked for.
+pub fn apply_rate(dev: usize, rate: f64) -> Result<(), OSStatus> {
+    let Some(st) = STATE.get(dev) else {
+        return Err(ERR_BAD_OBJECT);
+    };
+    if !SAMPLE_RATES.contains(&rate) {
+        return Err(ERR_ILLEGAL_VALUE);
+    }
+    st.set_rate(rate);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -505,18 +585,113 @@ mod tests {
         assert_eq!(checked, 5, "must have exercised all five devices");
     }
 
-    // Device index 4 (id 50) is used only by this test; `STATE` is shared.
-    #[test]
-    fn set_nominal_sample_rate_accepts_listed_rates_and_rejects_others() {
-        assert!(set_property_data(50, &addr(fourcc(b"nsrt")), &96000.0_f64.to_ne_bytes()).is_ok());
-        assert!(matches!(
-            device_property(4, &addr(fourcc(b"nsrt"))),
-            Ok(Value::F64(r)) if r == 96000.0
-        ));
+    /// An `AudioStreamBasicDescription` as the bytes a host hands `SetPropertyData`.
+    fn asbd_bytes(channels: u32, rate: f64) -> Vec<u8> {
+        let f = build_asbd(channels, rate);
+        let mut out = f.sample_rate.to_ne_bytes().to_vec();
+        for field in [
+            f.format_id,
+            f.format_flags,
+            f.bytes_per_packet,
+            f.frames_per_packet,
+            f.bytes_per_frame,
+            f.channels_per_frame,
+            f.bits_per_channel,
+            f.reserved,
+        ] {
+            out.extend_from_slice(&field.to_ne_bytes());
+        }
         assert_eq!(
-            set_property_data(50, &addr(fourcc(b"nsrt")), &12345.0_f64.to_ne_bytes()),
+            out.len(),
+            std::mem::size_of::<AudioStreamBasicDescription>()
+        );
+        out
+    }
+
+    fn rate_of(dev: usize) -> f64 {
+        STATE
+            .get(dev)
+            .map_or(0.0, super::super::device::PerDevice::rate)
+    }
+
+    // Device index 4 (id 50, streams 51/52) is used only by this test; `STATE` is shared.
+    #[test]
+    fn a_rate_set_is_validated_but_not_applied_until_apply_rate() {
+        let nsrt = addr(fourcc(b"nsrt"));
+        assert_eq!(
+            set_property_data(50, &nsrt, &96000.0_f64.to_ne_bytes()),
+            Ok(SetOutcome::RateChange {
+                dev: 4,
+                rate: 96000.0
+            })
+        );
+        assert_eq!(
+            rate_of(4),
+            48000.0,
+            "the HAL caches the rate: nothing may change before it performs the change"
+        );
+        assert_eq!(
+            set_property_data(50, &nsrt, &12345.0_f64.to_ne_bytes()),
             Err(ERR_ILLEGAL_VALUE)
         );
+        assert_eq!(
+            set_property_data(50, &nsrt, &48000.0_f64.to_ne_bytes()),
+            Ok(SetOutcome::Done),
+            "the current rate is not a change"
+        );
+
+        // Either stream's virtual or physical format is a second route to the same change.
+        for stream in [51, 52] {
+            for sel in [fourcc(b"sfmt"), fourcc(b"pft ")] {
+                assert_eq!(is_property_settable(stream, &addr(sel)), Ok(true));
+                assert_eq!(
+                    set_property_data(stream, &addr(sel), &asbd_bytes(128, 88200.0)),
+                    Ok(SetOutcome::RateChange {
+                        dev: 4,
+                        rate: 88200.0
+                    })
+                );
+                assert_eq!(
+                    set_property_data(stream, &addr(sel), &asbd_bytes(128, 48000.0)),
+                    Ok(SetOutcome::Done)
+                );
+                assert_eq!(
+                    set_property_data(stream, &addr(sel), &asbd_bytes(2, 88200.0)),
+                    Err(ERR_UNSUPPORTED_FORMAT),
+                    "a format of another channel count is not one this stream offers"
+                );
+                assert_eq!(
+                    set_property_data(stream, &addr(sel), &asbd_bytes(128, 12345.0)),
+                    Err(ERR_UNSUPPORTED_FORMAT)
+                );
+                assert_eq!(
+                    set_property_data(stream, &addr(sel), &88200.0_f64.to_ne_bytes()),
+                    Err(ERR_ILLEGAL_VALUE),
+                    "a bare rate is not a stream format"
+                );
+            }
+            assert_eq!(
+                is_property_settable(stream, &addr(fourcc(b"sdir"))),
+                Ok(false)
+            );
+            assert_eq!(
+                set_property_data(stream, &addr(fourcc(b"sdir")), &[0u8; 4]),
+                Err(ERR_UNSUPPORTED_OPERATION)
+            );
+        }
+        assert_eq!(rate_of(4), 48000.0);
+
+        assert_eq!(apply_rate(4, 12345.0), Err(ERR_ILLEGAL_VALUE));
+        assert_eq!(apply_rate(9, 96000.0), Err(ERR_BAD_OBJECT));
+        assert_eq!(rate_of(4), 48000.0);
+        assert_eq!(apply_rate(4, 88200.0), Ok(()));
+        assert_eq!(rate_of(4), 88200.0);
+        for is_input in [false, true] {
+            assert!(matches!(
+                stream_property(4, is_input, &addr(fourcc(b"pft "))),
+                Ok(Value::Asbd(f)) if f.sample_rate == 88200.0
+            ));
+        }
     }
 
     // Device index 1 (id 20) is used only by this test.
